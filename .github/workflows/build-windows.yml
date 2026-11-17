@@ -18,9 +18,9 @@ jobs:
       - name: Set up FFmpeg 9 and LLVM
         shell: pwsh
         run: |
-          $archive = 'ffmpeg-n9.0.2-10-g51c4a23d74-win64-lgpl-shared-9.0.zip'
+          $archive = 'ffmpeg-n9.0-latest-win64-lgpl-shared-9.0.zip'
           $directory = Join-Path $env:RUNNER_TEMP 'ffmpeg'
-          $url = "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-09-26-13-03/$archive"
+          $url = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/$archive"
           Invoke-WebRequest -Uri $url -OutFile (Join-Path $env:RUNNER_TEMP $archive)
           Expand-Archive (Join-Path $env:RUNNER_TEMP $archive) $directory
           $ffmpeg = (Get-ChildItem $directory -Directory | Select-Object -First 1).FullName
