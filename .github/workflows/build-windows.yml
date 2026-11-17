@@ -1,0 +1,41 @@
+name: Build Windows ZIP
+on:
+  push:
+    branches: [windows-build]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-2025
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Set up FFmpeg 9 and LLVM
+        shell: pwsh
+        run: |
+          $archive = 'ffmpeg-n9.0.2-10-g51c4a23d74-win64-lgpl-shared-9.0.zip'
+          $directory = Join-Path $env:RUNNER_TEMP 'ffmpeg'
+          $url = "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-09-26-13-03/$archive"
+          Invoke-WebRequest -Uri $url -OutFile (Join-Path $env:RUNNER_TEMP $archive)
+          Expand-Archive (Join-Path $env:RUNNER_TEMP $archive) $directory
+          $ffmpeg = (Get-ChildItem $directory -Directory | Select-Object -First 1).FullName
+          $clang = Join-Path $env:ProgramFiles 'LLVM\bin'
+          if (!(Test-Path (Join-Path $clang 'libclang.dll'))) { throw 'libclang.dll was not found' }
+          "FFMPEG_DIR=$ffmpeg" >> $env:GITHUB_ENV
+          "LIBCLANG_PATH=$clang" >> $env:GITHUB_ENV
+          Remove-Item Env:VCPKG_ROOT -ErrorAction SilentlyContinue
+          "VCPKG_ROOT=" >> $env:GITHUB_ENV
+      - name: Build and package
+        shell: pwsh
+        run: ./scripts/build-windows.ps1
+      - uses: actions/upload-artifact@v6
+        with:
+          name: xgview-windows-x64
+          path: target/xgview-*-windows-x86_64.zip
+          if-no-files-found: error
+          retention-days: 14
