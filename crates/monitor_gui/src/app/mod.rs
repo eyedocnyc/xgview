@@ -948,6 +948,7 @@ fn layout_hint(layout: GridLayout) -> &'static str {
         GridLayout::N10 => "toolbar-layout-10",
         GridLayout::N12 => "toolbar-layout-12",
         GridLayout::N13 => "toolbar-layout-13",
+        GridLayout::Custom { .. } => "settings-grid-custom",
         GridLayout::P1 => "toolbar-layout-p1",
         GridLayout::P2 => "toolbar-layout-p2",
         GridLayout::P3 => "toolbar-layout-p3",
