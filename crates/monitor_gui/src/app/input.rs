@@ -1065,6 +1065,7 @@ impl XgViewApp {
         // pointer, and the keys that open a panel are spent the same way, so one
         // dialog can never be stacked on another.
         let dialog_open = self.discovery.open
+            || self.layout_editor.is_open()
             || self.camera_edit.is_open()
             || self.remove_confirm.is_open()
             || self.system_confirm.is_open()
@@ -1145,6 +1146,7 @@ impl XgViewApp {
         // page turned underneath it would move the wall the viewer is not
         // looking at.
         if self.file_job.is_none()
+            && !self.layout_editor.is_open()
             && !self.layout_picker.is_open()
             && !self.portrait_aspect_picker.is_open()
             && !self.combined_info_picker.is_open()
@@ -1310,6 +1312,19 @@ impl XgViewApp {
         }
     }
 
+    /// A vertical arrow in the layout editor goes to the cell that is really
+    /// above or below the one under the ring. The row scopes only carry seats;
+    /// a wide cell covers several rows, so the nearest overlapping shape is
+    /// picked from the grid itself.
+    fn editor_vertical_target(&self, focused: Id, dir: Dir) -> Option<Id> {
+        let state = self.layout_editor.payload.as_ref()?;
+        let index = (0..state.grid.cells().len())
+            .find(|&i| egui::Id::new(("layout-editor-cell", i)) == focused)?;
+        state
+            .vertical_neighbor(index, dir)
+            .map(|next| egui::Id::new(("layout-editor-cell", next)))
+    }
+
     /// The keys a control of the navigation layer answers.
     ///
     /// The arrow moves by declaration - the scope's order, then its exits - and
@@ -1362,20 +1377,29 @@ impl XgViewApp {
             }
         };
         if let (Some(dir), Some(focused)) = (dir, ctx.memory(|memory| memory.focused())) {
-            match self.nav.step(focused, dir) {
+            let editor_target = if self.layout_editor.is_open() && matches!(dir, Dir::Up | Dir::Down) {
+                self.editor_vertical_target(focused, dir)
+            } else {
+                None
+            };
+            match editor_target.or_else(|| self.nav.step(focused, dir)) {
                 Some(target) => {
                     ctx.memory_mut(|memory| memory.request_focus(target));
                 }
                 None => {
-                    if dir == Dir::Down && self.nav.scope_of(focused) == Some("settings-body") {
+                    if dir == Dir::Down
+                        && matches!(
+                            self.nav.scope_of(focused),
+                            Some("settings-body" | "dialog-body")
+                        )
+                    {
                         // The press had nowhere to move the focus, which is
-                        // the case at the end of a tab: what follows the last
-                        // control - the adb line, the table of keys - is text
-                        // and has no control to be walked onto. A remote has
-                        // no wheel, so the press moves the body instead.
-                        // Asked for here rather than applied here: only a
-                        // scroll area that is being drawn reads a scroll
-                        // request, and this runs before anything is drawn.
+                        // the case at the end of a tab or a long form: what
+                        // follows the last control is text with no stop in
+                        // the ring. A remote has no wheel, so the press moves
+                        // the body instead. Asked for here rather than
+                        // applied here: only a scroll area that is being
+                        // drawn reads a scroll request.
                         let points = ctx.screen_rect().height() * REMOTE_SCROLL_FRACTION;
                         self.body_scroll = Some(points);
                     }
@@ -1437,6 +1461,16 @@ impl XgViewApp {
             } else if self.tile_bar.is_open() && !self.tile_bar_pinned() {
                 self.tile_bar.hide();
                 self.leave_controls(ctx);
+            } else if self.layout_editor.is_open() {
+                // The editor hangs over the Custom page: Back leaves the
+                // editor and puts that page back, with the ring on the control
+                // that opened it.
+                self.restore_focus = self.layout_editor.close_restoring();
+                self.layout_picker.open(());
+                self.layout_picker_tab = Some(PickerTab::Custom);
+                // Keep the control that first opened the picker: leaving the
+                // editor and then backing out of the picker still has to
+                // return the ring to it. Clearing this here lost it forever.
             } else if self.layout_picker.is_open() {
                 self.restore_focus = self.layout_picker.close_restoring();
             } else if self.portrait_aspect_picker.is_open() {
@@ -1525,6 +1559,7 @@ impl XgViewApp {
     fn screen_anchor(&self) -> Option<Id> {
         for (open, anchor) in [
             (self.file_picker.is_open(), self.file_picker.anchor),
+            (self.layout_editor.is_open(), self.layout_editor.anchor),
             (self.layout_picker.is_open(), self.layout_picker.anchor),
             (self.portrait_aspect_picker.is_open(), self.portrait_aspect_picker.anchor),
             (self.passphrase.is_open(), self.passphrase.anchor),
@@ -1563,11 +1598,6 @@ impl XgViewApp {
     }
 
     pub(super) fn handle_keys(&mut self, ctx: &egui::Context) {
-        if self.chrome.reveal_back {
-            ctx.input_mut(|input| consume_any(input, &BACK_WITH_BACKSPACE));
-            self.exit_armed = None;
-            return;
-        }
         // The ring a direction press asked for, put down before anything of this
         // frame can be read against it - and before the early ways out below, so
         // that a request made on the frame a window opened is not left lying
@@ -1988,6 +2018,19 @@ mod tests {
 
         assert!(pressed(Key::Escape, true), "Escape still closes from the field");
         assert!(pressed(Key::BrowserBack, true), "the remote's Back still closes from the field");
+    }
+
+    /// A Down off the last control is the only scroll a remote has. The
+    /// settings panel already used the request; the Add devices body must
+    /// spend the same one or its status line stays below the fold.
+    #[test]
+    fn a_remote_scrolls_the_devices_body_too() {
+        let input = include_str!("input.rs");
+        let scopes = format!("Some(\"settings-body\" | \"{}\")", "dialog-body");
+        assert!(input.contains(&scopes), "both bodies ask for the scroll");
+        let dialogs = include_str!("../dialogs.rs");
+        let spent = format!("{}.take()", "body_scroll");
+        assert!(dialogs.contains(&spent), "the dialog body spends it");
     }
 
     /// A pinned strip is part of the picture, not a layer the application's keys

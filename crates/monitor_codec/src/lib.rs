@@ -38,6 +38,12 @@ pub mod null;
 /// settles can be tested where the NDK decoder cannot be built.
 #[cfg_attr(not(target_os = "android"), allow(dead_code))]
 pub mod surface;
+/// What a surface can take, and what it is given. Compiled everywhere so the
+/// policy can be tested where the NDK decoder cannot be built.
+pub mod handover;
+/// Whether a codec hands its pictures over in the order they are shown in.
+/// Compiled everywhere for the same reason.
+pub mod reorder;
 pub mod sps;
 pub mod wait;
 
@@ -303,6 +309,27 @@ pub trait VideoDecoder: Send {
 
     /// Stream description once known.
     fn info(&self) -> Option<&VideoStreamInfo>;
+
+    /// Whether this stream has been seen to hand its pictures over out of
+    /// order, which is a stream that reorders and must be allowed to.
+    ///
+    /// A decoder that asks for low latency gives up its reordering, and one
+    /// here notices when the pictures come back in the wrong order and reopens
+    /// itself without the ask. This is how the caller learns that the stream is
+    /// one to leave alone in the first place - see `sps::declare_no_reorder`.
+    fn reordering(&self) -> bool {
+        false
+    }
+
+    /// Drops the session the decoder is holding, so the next access unit opens
+    /// a new one configured from the parameter sets as they arrive.
+    ///
+    /// For a declaration that turned out to be wrong: a set rewritten to say
+    /// the stream does not reorder stays in the decoder that was configured
+    /// from it, and the only way back is a session opened on the set the
+    /// camera sends. Nothing for a backend that configures itself per picture,
+    /// which is the default.
+    fn restart(&mut self) {}
 
     /// Pictures this decoder has produced since it was created.
     ///

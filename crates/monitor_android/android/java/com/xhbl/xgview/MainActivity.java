@@ -1461,6 +1461,18 @@ public class MainActivity extends NativeActivity {
     private static AudioTrack talkOutput;
 
     /**
+     * Frames handed to the track, and how often the depth has been reported.
+     *
+     * <p>The waterline in the session counts the sound waiting on our side of
+     * the JNI bridge; it cannot see what has already been written into the
+     * track and is still waiting there. The playback head is the only answer to
+     * how far behind the speaker really is, so it is read here, away from the
+     * picture loop, and reported once in a while rather than per packet.
+     */
+    private static long playbackWrittenFrames = 0;
+    private static int playbackTick = 0;
+
+    /**
      * The makeup gain applied to the call's playback, in linear terms.
      *
      * <p>The voice path's gain staging is a call's, which leaves speech quieter
@@ -1673,6 +1685,13 @@ public class MainActivity extends NativeActivity {
         if (min <= 0) {
             return false;
         }
+        // Half a second, at sixteen-bit samples: rate frames. An eight-kilohertz
+        // AAC packet is a hundred and twenty-eight milliseconds, so this holds
+        // several whole packets - enough for a non-blocking write to land. This
+        // is the size the player used before the audio waterline was added, and
+        // viewers heard that version as closer to the picture. A larger track
+        // only adds delay nothing on this side can take back: no waterline can
+        // see the sound already in here.
         final AudioTrack track = new AudioTrack.Builder()
                 .setAudioAttributes(new AudioAttributes.Builder()
                         .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
@@ -1683,7 +1702,7 @@ public class MainActivity extends NativeActivity {
                         .setSampleRate(rate)
                         .setChannelMask(channelMask)
                         .build())
-                .setBufferSizeInBytes(Math.max(min, rate / 2 * 2 * channels))
+                .setBufferSizeInBytes(Math.max(min, rate * channels))
                 .setTransferMode(AudioTrack.MODE_STREAM)
                 .build();
         if (track.getState() != AudioTrack.STATE_INITIALIZED) {
@@ -1692,14 +1711,43 @@ public class MainActivity extends NativeActivity {
         }
         track.play();
         talkOutput = track;
+        playbackWrittenFrames = 0;
+        playbackTick = 0;
         // Again, after the track exists: the routing follows the mode, and the
         // mode is the thing that drifts.
         if (audio != null) {
             audio.setMode(AudioManager.MODE_IN_COMMUNICATION);
             audio.setSpeakerphoneOn(true);
         }
-        android.util.Log.i("xgview", "talk playback opened rate=" + rate + " channels=" + channels);
+        android.util.Log.i(
+                "xgview",
+                "talk playback opened rate=" + rate + " channels=" + channels
+                        + " buffer=" + track.getBufferSizeInFrames() + " frames");
         return true;
+    }
+
+    /**
+     * Frames accepted by the track but not yet played, or zero if there is no
+     * track. Read for the periodic depth log: the session's own waterline
+     * cannot see what has already been written into the device, and this is the
+     * only place that can say how much sound is really waiting on the speaker.
+     * The timestamp is the precise form; the head position is the older
+     * fallback.
+     */
+    public static int playbackQueuedFrames() {
+        final AudioTrack track = talkOutput;
+        if (track == null) {
+            return 0;
+        }
+        final android.media.AudioTimestamp stamp = new android.media.AudioTimestamp();
+        final long head = track.getTimestamp(stamp)
+                ? stamp.framePosition
+                : (long) track.getPlaybackHeadPosition();
+        final long behind = playbackWrittenFrames - head;
+        if (behind <= 0) {
+            return 0;
+        }
+        return (int) Math.min(behind, Integer.MAX_VALUE);
     }
 
     /**
@@ -1707,25 +1755,46 @@ public class MainActivity extends NativeActivity {
      *
      * <p>The voice path's gain staging is a call's, which leaves speech a little
      * quieter than the media path at the same volume; {@link #TALK_GAIN} is what
-     * buys that back. Non-blocking: a full track drops the block rather than
-     * stalling the native worker that pushed it, and that worker is also pumping
-     * the picture.
+     * buys that back, and it is applied to a camera's sound as well - that is the
+     * level the viewer settled on, and taking it away would drop every channel
+     * six decibels the moment a call ends.
+     *
+     * <p>Non-blocking, and a full track cuts the block rather than stalling the
+     * native worker that pushed it - that worker is also pumping the picture. What
+     * the track would not take is said out loud: it is a hole in the sound, and
+     * the only way to tell it from a camera's own noise.
      */
     public static void pushTalkPlayback(final short[] samples, final int count) {
         final AudioTrack track = talkOutput;
         if (track == null) {
             return;
         }
-        // The voice path runs quieter than the media path, so the samples are
-        // lifted by {@link #TALK_GAIN} before they leave. In place: each block is
-        // its own array, and what the caller handed over is not read again. A soft
-        // clip keeps a frame the gain pushes past full scale from ringing.
+        // In place: each block is its own array, and what the caller handed over
+        // is not read again. A soft clip keeps a frame the gain pushes past full
+        // scale from ringing.
         for (int i = 0; i < count; i++) {
             final double normalised = samples[i] / 32768.0 * TALK_GAIN;
             final int lifted = (int) (32767.0 * Math.tanh(normalised));
             samples[i] = (short) lifted;
         }
-        track.write(samples, 0, count, AudioTrack.WRITE_NON_BLOCKING);
+        final int written = track.write(samples, 0, count, AudioTrack.WRITE_NON_BLOCKING);
+        if (written > 0) {
+            playbackWrittenFrames += written / Math.max(1, track.getFormat().getChannelCount());
+        }
+        if (written < count) {
+            android.util.Log.w(
+                    "xgview", "playback took " + written + " of " + count + " samples");
+        }
+        if (++playbackTick % 60 == 0) {
+            final int rate = track.getFormat().getSampleRate();
+            final long behind = playbackQueuedFrames();
+            android.util.Log.i(
+                    "xgview",
+                    "playback depth rate=" + rate
+                            + " buffer=" + track.getBufferSizeInFrames()
+                            + " written=" + playbackWrittenFrames
+                            + " behind_ms=" + (behind * 1000L / Math.max(rate, 1)));
+        }
     }
 
     /** The playback's volume, {@code 0.0..=1.0}. */

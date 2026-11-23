@@ -65,6 +65,12 @@ use crate::{
 /// A live channel at twenty-five frames a second, and a recording played at its
 /// own speed, are further apart than this gap and hand over every picture they
 /// have. Only a read that is faster than the screen is thinned.
+///
+/// A live stream reaches the decoder a picture at a time whatever the wire did,
+/// because the session places each picture on the clock its timestamp names
+/// first; see `pipeline::rtsp_session::LivePacer`. A gap narrowed so a burst
+/// could pass was a stopgap that made the picture worse, and is no longer what
+/// this is for.
 const HANDOVER_GAP: Duration = Duration::from_millis(25);
 
 /// Decoder backed by FFmpeg's `libavcodec`.

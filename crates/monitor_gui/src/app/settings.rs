@@ -4,41 +4,6 @@
 use super::*;
 
 impl XgViewApp {
-    pub(super) fn custom_grid_controls(&mut self, ui: &mut egui::Ui) {
-        let current = self.scheduler.layout();
-        let custom = matches!(current, GridLayout::Custom { .. });
-        let response = self.nav.tracked(ui.selectable_label(custom, monitor_i18n::tr("settings-grid-custom")));
-        self.name(&response, "settings-grid-custom");
-        if response.clicked() && !custom {
-            self.set_layout(GridLayout::Custom { columns: 3, rows: 2 });
-        }
-        if custom {
-            use monitor_core::layout::MAX_GRID_DIMENSION;
-
-            let mut columns = current.grid_cols() as u8;
-            let mut rows = current.grid_rows() as u8;
-            let mut changed = false;
-            for (key, value) in [
-                ("settings-grid-columns", &mut columns),
-                ("settings-grid-rows", &mut rows),
-            ] {
-                ui.horizontal(|ui| {
-                    ui.label(monitor_i18n::tr(key));
-                    for dimension in 1..=MAX_GRID_DIMENSION {
-                        let response = self.nav.tracked(ui.selectable_label(*value == dimension, dimension.to_string()));
-                        if response.clicked() && *value != dimension {
-                            *value = dimension;
-                            changed = true;
-                        }
-                    }
-                });
-            }
-            if changed {
-                self.set_layout(GridLayout::Custom { columns, rows });
-            }
-        }
-    }
-
     /// Opens a link the way the desktop does.
     ///
     /// egui would hand the URL to eframe, which opens it through the
@@ -222,13 +187,14 @@ impl XgViewApp {
             let active = !current.is_standard();
             let more = self
                 .nav
-                .tracked(ui.selectable_label(active || self.layout_picker.is_open(), current.numeric_label().unwrap_or("…")));
+                .tracked(ui.selectable_label(active || self.layout_picker.is_open(), current.toolbar_label()));
             self.name(&more, "toolbar-layout-more");
             if more.clicked() {
                 if self.layout_picker.is_open() {
                     self.layout_picker.close();
                 } else {
                     self.layout_picker.open(());
+                    self.layout_picker_tab = None;
                 }
                 // Only for a press that came from the keyboard or a remote: a
                 // pointer does not move the focus anywhere else in this program,
@@ -238,8 +204,6 @@ impl XgViewApp {
                 .then_some(more.id);
             }
         });
-        ui.add_space(theme::space::S);
-        self.custom_grid_controls(ui);
         ui.add_space(theme::space::S);
         ui.label(RichText::new(monitor_i18n::tr("settings-osd")).strong());
         ui.label(
@@ -340,44 +304,73 @@ impl XgViewApp {
         }
 
         ui.add_space(theme::space::S);
-        let clean = self.nav.tracked(ui.checkbox(
-            &mut self.config.clean_view,
-            monitor_i18n::tr("settings-clean-view"),
-        ));
-        self.name(&clean, "settings-clean-view");
-        if clean.changed() {
-            self.chrome.visible = true;
-            self.chrome.hide_now = false;
-            self.chrome.last_input = Instant::now();
-            dirty = true;
-        }
+        // Clean View: which modes hide the bars, and whether the corner OSD goes
+        // with them. The delay is the old auto-hide setting, reused so an upgrade
+        // keeps its value and its meaning. A change re-arms the clock: the next
+        // frame must not take the bars away mid-adjustment.
+        ui.label(RichText::new(monitor_i18n::tr("settings-clean-view")).strong());
         ui.label(
             RichText::new(monitor_i18n::tr("settings-clean-view-hint"))
                 .small()
                 .color(theme::TEXT_DIM),
         );
+        ui.horizontal_wrapped(|ui| {
+            let fullscreen = self.nav.tracked(ui.checkbox(
+                &mut self.config.clean_view_fullscreen,
+                monitor_i18n::tr("settings-clean-view-fullscreen"),
+            ));
+            self.name(&fullscreen, "settings-clean-view-fullscreen");
+            dirty |= fullscreen.changed();
+            fullscreen.on_hover_text(monitor_i18n::tr("settings-clean-view-fullscreen-tip"));
 
-        ui.add_space(theme::space::S);
-        ui.add_enabled_ui(!self.config.clean_view, |ui| {
-            let idle = controls::slider(
-                &mut self.nav,
-                ui,
-                &mut self.config.chrome_idle_secs,
-                0.0..=10.0,
-                0.5,
-                "s",
-                &monitor_i18n::tr("settings-chrome-idle"),
-                3.5,
-            );
-            if idle.changed() {
-                dirty = true;
+            // A real window can hide on a desktop. There is no window mode on
+            // Android - `fullscreen == false` is the viewer pinning their own
+            // bars - so the switch is not drawn there at all rather than shown
+            // greyed out: a dead control still in the focus order has no visual
+            // feedback when a remote walks onto it.
+            #[cfg(not(target_os = "android"))]
+            {
+                let windowed = self.nav.tracked(ui.checkbox(
+                    &mut self.config.clean_view_windowed,
+                    monitor_i18n::tr("settings-clean-view-windowed"),
+                ));
+                self.name(&windowed, "settings-clean-view-windowed");
+                dirty |= windowed.changed();
+                windowed.on_hover_text(monitor_i18n::tr("settings-clean-view-windowed-tip"));
             }
-            ui.label(
-                RichText::new(monitor_i18n::tr("settings-chrome-idle-hint"))
-                    .small()
-                    .color(theme::TEXT_DIM),
-            );
+
+            let osd = self.nav.tracked(ui.checkbox(
+                &mut self.config.clean_view_osd,
+                monitor_i18n::tr("settings-clean-view-osd"),
+            ));
+            self.name(&osd, "settings-clean-view-osd");
+            dirty |= osd.changed();
+            osd.on_hover_text(monitor_i18n::tr("settings-clean-view-osd-tip"));
         });
+        ui.add_space(theme::space::XS);
+        let idle = controls::slider(
+            &mut self.nav,
+            ui,
+            &mut self.config.chrome_idle_secs,
+            0.0..=10.0,
+            0.5,
+            "s",
+            &monitor_i18n::tr("settings-chrome-idle"),
+            3.5,
+        );
+        if idle.changed() {
+            dirty = true;
+        }
+        ui.label(
+            RichText::new(monitor_i18n::tr("settings-chrome-idle-hint"))
+                .small()
+                .color(theme::TEXT_DIM),
+        );
+        ui.label(
+            RichText::new(monitor_i18n::tr("settings-clean-view-behaviour"))
+                .small()
+                .color(theme::TEXT_DIM),
+        );
 
         ui.add_space(theme::space::S);
         if self.settings_language(ui) {
@@ -990,6 +983,14 @@ impl XgViewApp {
                 ui.label(monitor_i18n::tr("about-cpu-unknown"));
             }
         }
+        ui.label(monitor_i18n::tr_args(
+            "about-network-current",
+            &[("mbps", format!("{:.2}", self.network_traffic.current_mbps()).into())],
+        ));
+        ui.label(monitor_i18n::tr_args(
+            "about-network-average",
+            &[("mbps", format!("{:.2}", self.network_traffic.average_mbps()).into())],
+        ));
         ui.label(monitor_i18n::tr_args("about-system", &[("os", self.vitals.os().into())]));
         ui.label(monitor_i18n::tr_args(
             "about-uptime",

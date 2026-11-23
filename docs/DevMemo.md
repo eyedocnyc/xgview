@@ -576,6 +576,32 @@ extra failed configure per session on the devices that will not take it, logged 
 "the decoder refused low latency; opening without it". The SHIELD, whose decoder
 accepts it, keeps it: nine sessions opened with `low_latency=true` and no fallback.
 
+**The option came back, and the fallback above is why it could.** §17 lost the
+flag to an H.265 stream with B-frames - a decoder told to be fast hands pictures
+over in the order it decoded them, and a tile showing an older picture after a
+newer one reads as a shutter. What brought it back is a twelve frame a second
+doorbell: left to reorder, its decoder returned eight pictures once every seven
+hundred milliseconds, so the tile froze for three quarters of a second and then
+jumped - `shown=695, 80, 86, 75, 7, 7, 7, 7, 7, 7, 7, 7` - and came back `82, 84,
+82, 83` once the option was asked for. Asking is only safe with two things in
+place: the fallback above, and a memory of the refusal. Without the memory, every
+channel on a device that will not take the ask pays a failed configure and then
+reads the failure as *the stream* being refused, which is what drops it to
+OpenH264 - measured on the GRL-AL10 as four channels at `SW 19.96fps` before, and
+`HW` after `LOW_LATENCY_REFUSED` remembered the answer for the process.
+
+The B-frame cost is taken back by measurement rather than by a setting. The NDK
+cannot be asked whether a codec takes the option, nor whether a stream reorders,
+and the SDP says neither, so `monitor_codec::reorder` counts what the output
+does: a picture handed over before the one it follows, twice, and the stream is
+taken to need the decoder's reordering - the session is closed and reopened
+without the ask, and the depth then costs its few frames of delay, which is the
+price of showing the stream in the order it is meant to be seen in. A jump back
+by seconds is a replay seeking rather than a picture out of order, and is not
+counted - which is what keeps low latency on a recording that is skipped
+through. The disorder it watches for is §17's `2, 7, 5, 4, 6, 11, 9, 8, 10`, and
+the tests in that module are written against it.
+
 *Note for the next time a codec configure fails:* the verbose framework tags flood
 the logcat ring buffer within seconds, and the ordinary `tracing` lines that carry
 each channel's state are rolled out first. Set the tags back to `INFO` when done.
@@ -6411,3 +6437,181 @@ aspect switch move the picture's own view. A hardware keyboard types into fields
 and keeps F1/F2/F11, and the loop waits for egui's next repaint instead of
 compositing an idle wall sixty times a second. See
 `priv/docs/android-surface-plan.md` §25.
+
+## 72. A second look at the clock, the codec and the sound
+
+Three passes over the whole of the live-view work - one over the picture's
+clock, one over the decoder and what reaches the surface, one over the audio - each read
+against the diff and against the device logs it was meant to explain. Seven
+things were found. Five are fixed here; the other two are written down below
+because writing them down is what stops them being lost.
+
+**A refused option was remembered on the strength of the wrong failure.** The
+fallback restored in §9 remembered `low-latency` as refused on any
+`CodecError::Configure`, which also covers `AMediaCodec_start`. A start that
+fails for an unrelated reason - this file already records a tenth channel on an
+Amlogic box doing exactly that - would take the option away from every channel
+opened after it, for the life of the process, and put the doorbell back to
+arriving eight pictures at a time. The two steps are apart now: `configure`
+leaves a codec unstarted, and `open_session` starts it after the retry decision
+is made, so a refusal is only remembered when a session that did *not* ask has
+configured successfully. Measured again: the GRL-AL10 logs one ask, one refusal
+and then only `asked=false`; the Shield logs nine asks and no refusal.
+
+**Giving up a picture broke the ones behind it.** The queue's ceiling gave up
+the oldest picture that was not a key frame, on the reasoning that the key frame
+would carry the ones after it. In a P stream every picture but the newest is
+predicted from the one before it, so what was actually left was a key frame,
+a run of orphans, and a decoder waiting for the next IDR to show any of them.
+The cut is now at a key frame: the run before the first key frame with another
+one after it goes, and what remains starts on a key frame and carries its own
+chain. When only the first picture is a key frame, nothing here can be given up
+without orphaning the rest, so the newest goes instead and the crowd rule deals
+with a queue that stays deep. A test with two key frames and fourteen pictures
+checks that the cut leaves a decodable run, not just a non-empty queue.
+
+**Thirty frames a second sat three milliseconds from the replay threshold.**
+`LIVE_FEED` was thirty milliseconds, and a thirty frame stream is thirty-three
+and a third: a smoothed estimate that dipped could read a live camera as a
+replay, which for a decoder that returns pictures in batches throws away all
+but one of each. The threshold is twenty - still far above the fifty a second
+an eight times replay feeds, and now far enough from any live camera that a
+dip does not cross it.
+
+**A channel that was not being listened to kept its sound.** `on_audio`
+cleared the waiting samples only while the sink was active; a channel switched
+away kept a quarter of a second of sound, and switching back put that old
+quarter-second in front of the new one. The other branch clears it too.
+
+**Opening does not fold a whole crowd.** This one is recorded rather than
+fixed. The fold ends at the first picture the loop hands over, which at a
+hundred and sixty milliseconds of lead is two pictures of a twenty-five frame
+stream. A forwarder that flushes more than that leaves the rest spread over the
+wire's own timestamps, half a second behind, until the queue stays deep for a
+second and `deep_since` folds it back - one visible jump instead of a long lag.
+No box here flushes that way: the deepest queue measured was two. The
+limitation is written on the `opening` field so the next reader does not take
+the name for a promise.
+
+**The sound's delay can still grow.** The waterline is measured against the
+queue in this process, not against the samples already inside `AudioTrack`;
+nothing reads `getPlaybackHeadPosition`. A camera clock a few parts per million
+fast, or a batch of audio after a network repair, can fill the device's buffer
+without the waterline ever seeing it, until short writes become holes and the
+picture and the sound are no longer together. Fixing it means teaching
+`AudioOutput` to report what the device still has queued and skipping a whole
+packet when it is over the mark - three implementations and the JNI bridge,
+left here as the next piece of work. Related, and also left: the two second
+buffer was chosen because a 128 millisecond packet would not fit in six
+hundred samples, which was never true - the old expression already asked for
+half a second. The real fault was metering sound out twenty milliseconds at a
+time, which is fixed. The two seconds can stay as room for a burst, but it is
+not the fix it was said to be. And `tanh` at a gain of two is a limiter over
+the whole range: a half-scale sample comes out two and a half decibels below
+where a plain multiply would put it, while full scale is slightly attenuated.
+It prevents wrap-round, which was the point, but it is not "gain plus soft
+clipping" and should not be described as such.
+
+The workspace ran 795 tests green, and two builds were put on all four boxes.
+The onn box went offline while they were being checked and came back; its
+thirty-two bit package was installed and opened without complaint.
+
+Version to 2.2.102. No changelog, tag or push yet.
+
+## 73. Two attempts at the sound's delay, and why neither is here
+
+The sound still sits two to four seconds behind the picture on the onn box,
+and two fixes were tried and taken back out. Both are recorded so neither is
+attempted a third time without the measurements in front of it.
+
+**Reading the playback head.** Teach `AudioOutput` to report what the device
+has queued and stop writing when it exceeds the watermark. It cannot work: an
+`AudioTrack` in `MODE_STREAM` underruns when its writer stops, the head freezes,
+and the feedback reads a permanently full track and stops for good. A probe
+found the track playing with its queue counter pinned while the queue on this
+side grew; the head advanced normally once writing resumed. The policy, not the
+device, was wrong. A shorter buffer of three quarters of a second did help - it
+cut the measured device backlog from two seconds to four hundred and nine
+hundred milliseconds - and that change stands.
+
+**Putting sound on its own clock.** Decode each AAC access unit separately,
+stamp it with its RTP timestamp, hold it until that moment, and hand it over
+from the packet loop. Three measurements say this is not the fix:
+units were placed only three hundred to six hundred milliseconds into the
+future, they were handed over within ten milliseconds of their moment, and the
+device's own backlog did not shrink. Worse, the access units do not decode to a
+fixed length - measured sizes ran from six hundred and forty to fourteen hundred
+and fifty-nine samples - so the fixed one-thousand-and-twenty-four-tick spacing
+assumed for them was wrong, and the queue grew to eight or twelve units. The
+viewer heard a *longer* delay than before. The change was reverted.
+
+**What the measurements do say.** The delay is not in the queue on this side,
+nor in when the loop hands sound to the sink: both were measured and small. It
+lives below the JNI bridge - in `AudioTrack`'s own buffer and the Amlogic HAL,
+whose reported `getTimestamp().framePosition` appears not to be the speaker's
+real position, so the depth read here understates what the ear hears. There is
+no RTCP sender report from the forwarder either (probed: not one packet on
+either track), so there is no NTP-to-RTP mapping to align the two streams by.
+A real fix has to measure the speaker's actual position, or give the audio a
+clock the sink can follow, neither of which this forwarder offers today.
+
+The forwarder's opening burst remains the source of the first couple of
+seconds: video folds it, audio does not. That is still worth doing, but it is a
+smaller change than either of the above and should be measured against the
+ear, not against `AudioTrack`'s counters.
+
+## 74. Sound without a waterline
+
+Three attempts to make the sound sit closer to the picture were made and
+removed (§73). The viewer then supplied the measurement that was missing all
+along: the picture itself is about a second behind real life because the
+forwarder buffers it, and the sound is only about a second behind the picture -
+and the 2.2.98 build, which sounded closer, had no audio waterline at all.
+
+A diff against that build found the difference. Before the live clock work a
+decoded audio packet went straight to the sink:
+
+    decode -> output.push(&pcm)
+
+with a half-second AudioTrack buffer. The live clock added a waterline of
+`lead + AUDIO_SETTLE` - a hundred and sixty plus a hundred milliseconds - held
+the decoded samples until they were past it, and wrote only what was over. The
+sink buffer grew from half a second to three quarters. Those two changes are
+about half a second of extra delay, on a stream where the picture's own second
+comes from the forwarder and cannot be removed here: the sound was being made
+to wait for a picture that was already late.
+
+Both are now back to their earlier values: decoded sound is written as it is
+decoded, and the track is half a second. The queue and rate fields stay: they
+are what a sink reopen drops, so switching channels cannot put the previous
+channel's sound in front of the new one. The playback-head log stays too - it
+is the only window into the sink's own backlog.
+
+What remains is the forwarder's second, common to both streams, and whatever
+the Amlogic HAL adds below the head reading. An RTCP sender report would tie
+the two streams to one clock, but the forwarder sends no RTCP at all (§73).
+The viewer is the judge of whether this is closer; the counters here cannot
+see the speaker.
+
+## 75. The delay is in the recordings and the devices, not the player
+
+The viewer compared the same recording across three Android devices and a
+browser, all on the current build:
+
+- onn (Amlogic), SHIELD (NVIDIA) and the Huawei GRL-AL10 (Kirin) each show the
+  sound about a second behind the picture.
+- Frigate's own WebUI, which is a browser's plain video element and shares no
+  code with this player, shows the same thing, a little shorter.
+
+Three different SoCs and an independent player all land in the same place. The
+one second is therefore not the player's waterline, its clock, or its handover:
+none of those are shared with a browser, and four earlier attempts to fix the
+delay here were measured and removed (§73, §74). It is what the recording
+carries and what an Android device takes to get sound out of an AudioTrack and
+through its HAL - on onn the track is four thousand frames at eight kilohertz
+(half a second) and the HAL reports another hundred and fifty milliseconds.
+
+Section 74 is the right state to leave the player in: sound is written as it is
+decoded, and the device buffer is half a second, the smallest of the settings
+tried. Any further alignment has to come from the forwarder or the recording,
+not from here.

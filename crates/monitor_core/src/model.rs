@@ -815,31 +815,39 @@ impl CameraSource {
         }
     }
 
+    /// The name the connection switch shows for one of this camera's stops.
+    /// Kept beside `connection_label` so a menu can name the next stop without
+    /// changing the camera first.
+    pub fn connection_label_for(&self, stop: ConnectionStop) -> &'static str {
+        match stop {
+            ConnectionStop::Auto => "AUTO",
+            ConnectionStop::Mse => "MSE",
+            ConnectionStop::RtspTcp if self.has_mse() => "RTSP",
+            ConnectionStop::RtspTcp => "TCP",
+            ConnectionStop::RtspUdp => "UDP",
+        }
+    }
+
     /// The label the connection switch shows for the camera's current stop. It
     /// names the protocol where there are two to choose from, and the transport
     /// where there is only RTSP.
     pub fn connection_label(&self) -> &'static str {
-        match self.connection_stop() {
-            ConnectionStop::Auto => "AUTO",
-            ConnectionStop::Mse => "MSE",
-            ConnectionStop::RtspTcp => {
-                if self.has_mse() {
-                    "RTSP"
-                } else {
-                    "TCP"
-                }
-            }
-            ConnectionStop::RtspUdp => "UDP",
-        }
+        self.connection_label_for(self.connection_stop())
+    }
+
+    /// The next stop the connection switch would move to, without changing the
+    /// camera. A menu names it before the viewer commits to the switch.
+    pub fn next_connection(&self) -> ConnectionStop {
+        let stops = self.connection_stops();
+        let current = self.connection_stop();
+        let index = stops.iter().position(|stop| *stop == current).unwrap_or(0);
+        stops[(index + 1) % stops.len()]
     }
 
     /// Moves the connection switch on to the next stop it offers, writing both
     /// the mode and the transport back.
     pub fn advance_connection(&mut self) {
-        let stops = self.connection_stops();
-        let current = self.connection_stop();
-        let index = stops.iter().position(|stop| *stop == current).unwrap_or(0);
-        let next = stops[(index + 1) % stops.len()];
+        let next = self.next_connection();
         match next {
             ConnectionStop::Auto => self.connect = ConnectionMode::Auto,
             ConnectionStop::RtspTcp => {
@@ -868,15 +876,55 @@ impl CameraSource {
         self.rtsp_sub.is_some() || self.mse_sub.is_some()
     }
 
+    /// The other stop the grid's stream switch would move to, without
+    /// changing the camera. The wall pulls sub by default and pins main when
+    /// the viewer asks for it; coming back clears the pin.
+    pub fn next_stream(&self) -> StreamKind {
+        match self.grid_stream() {
+            StreamKind::Main => StreamKind::Sub,
+            StreamKind::Sub => StreamKind::Main,
+        }
+    }
+
     /// Moves the tile's stream switch on to its other stop, as a press on the
     /// row's button does: the sub stream the wall pulls by default, and the main
     /// stream the viewer pinned. Coming back to the default clears the pin, so
     /// the configuration keeps only the tiles that were singled out.
     pub fn advance_stream(&mut self) {
-        self.stream = match self.grid_stream() {
-            StreamKind::Main => None,
-            StreamKind::Sub => Some(StreamKind::Main),
+        self.stream = match self.next_stream() {
+            StreamKind::Main => Some(StreamKind::Main),
+            StreamKind::Sub => None,
         };
+    }
+
+    /// The picture-fit mode for the wall's current orientation. Landscape and
+    /// upright keep independent fits so a camera can fill a landscape tile and
+    /// stay at its own ratio when the wall stands up; a control that cycles the
+    /// fit has to read the one the viewer is actually looking at.
+    pub fn aspect_for(&self, portrait: bool) -> TileAspect {
+        if portrait {
+            self.portrait_aspect
+        } else {
+            self.aspect
+        }
+    }
+
+    /// The fit the picture-fit control would move to, without changing the
+    /// camera. The menu names it before the viewer commits to the switch, and
+    /// it must name the same field [`Self::advance_aspect`] writes.
+    pub fn next_aspect(&self, portrait: bool) -> TileAspect {
+        self.aspect_for(portrait).next()
+    }
+
+    /// Moves the picture-fit control on to its next mode in the orientation the
+    /// wall is currently in, leaving the other orientation's fit alone.
+    pub fn advance_aspect(&mut self, portrait: bool) {
+        let next = self.next_aspect(portrait);
+        if portrait {
+            self.portrait_aspect = next;
+        } else {
+            self.aspect = next;
+        }
     }
 
     /// `host:port` string used inside the UI.
@@ -1115,10 +1163,28 @@ static SUB_STREAM_RULES: LazyLock<Vec<(Regex, &'static str)>> = LazyLock::new(||
         )
     };
     vec![
-        // Hikvision / HiWatch / generic NVR: /Streaming/Channels/101 -> 102
-        rule(r"(/Streaming/Channels/\d)01$", "${1}02"),
+        // Hikvision / HiWatch / generic NVR: /Streaming/Channels/101 -> 102.
+        // The channel number can be more than one digit: 1601 -> 1602.
+        rule(r"(/Streaming/Channels/\d+)01$", "${1}02"),
         // Dahua / Amcrest: ...&subtype=0 -> subtype=1
         rule(r"([?&]subtype=)0\b", "${1}1"),
+        // Reolink: /Preview_01_main -> /Preview_01_sub. A 4K main stream may
+        // be h265, but Reolink's sub stream is always h264, so the h265 form
+        // has to be normalised. Keep these two rules together and in order:
+        // the first leaves h265 alone, the second rewrites it to h264.
+        rule(r"(/(?:h264)?Preview_\d+_)main\b", "${1}sub"),
+        rule(r"(/h265)(Preview_\d+_)main\b", "/h264${2}sub"),
+        // EZVIZ and older Hikvision-style IPCs: /h264/ch1/main/av_stream.
+        rule(r"(/(?:h264|h265)/ch\d+/)main(/av_stream)", "${1}sub${2}"),
+        // Xiongmai and OEM cameras with a `stream=0` query parameter.
+        rule(r"([?&]stream=)0\b", "${1}1"),
+        // Uniview: /unicast/c1/s0/live -> s1, and /media/video1 -> video2.
+        rule(r"(/unicast/c\d+/s)0(/live)", "${1}1${2}"),
+        rule(r"(/media/video)1$", "${1}2"),
+        // Bosch: /video?inst=1 -> inst=2; the rec parameter is left alone.
+        rule(r"([?&]inst=)1\b", "${1}2"),
+        // Vivotek: /live.sdp -> /live2.sdp.
+        rule(r"(/live)(\.sdp)$", "${1}2${2}"),
         // Foscam: /videoMain -> /videoSub
         rule(r"/videoMain$", "/videoSub"),
         // Axis / generic: ?stream=main -> ?stream=sub
@@ -1202,6 +1268,38 @@ mod tests {
         assert_eq!(TileAspect::Original.ratio(), None, "the stream's own shape");
         assert_eq!(TileAspect::Ratio16x9.ratio(), Some(16.0 / 9.0));
         assert_eq!(TileAspect::Ratio1x1.ratio(), Some(1.0));
+    }
+
+    /// A picture-fit switch reads and writes the fit for the wall's current
+    /// orientation. The two fits are independent: cycling one must leave the
+    /// other exactly where it was, and the label the menu shows must be the
+    /// mode the press actually moves to.
+    #[test]
+    fn the_picture_fit_switch_follows_the_walls_orientation() {
+        let mut camera = CameraSource::new("a", "rtsp://h/x");
+        camera.aspect = TileAspect::Original;
+        camera.portrait_aspect = TileAspect::Ratio4x3;
+
+        // Landscape reads and advances only the landscape fit.
+        assert_eq!(camera.aspect_for(false), TileAspect::Original);
+        assert_eq!(camera.next_aspect(false), TileAspect::Stretch);
+        camera.advance_aspect(false);
+        assert_eq!(camera.aspect, TileAspect::Stretch);
+        assert_eq!(camera.portrait_aspect, TileAspect::Ratio4x3, "upright fit untouched");
+
+        // Upright reads and advances only the portrait fit, from where it was
+        // left - not from the landscape fit just advanced.
+        assert_eq!(camera.aspect_for(true), TileAspect::Ratio4x3);
+        assert_eq!(camera.next_aspect(true), TileAspect::Ratio1x1);
+        camera.advance_aspect(true);
+        assert_eq!(camera.portrait_aspect, TileAspect::Ratio1x1);
+        assert_eq!(camera.aspect, TileAspect::Stretch, "landscape fit untouched");
+
+        // Wrapping: the last upright mode comes back to the first, still only
+        // in the portrait field.
+        camera.advance_aspect(true);
+        assert_eq!(camera.portrait_aspect, TileAspect::Original);
+        assert_eq!(camera.aspect, TileAspect::Stretch);
     }
 
     /// The magnified viewport's fit is absent until it is set, so a camera's
@@ -1450,11 +1548,79 @@ mod tests {
 
     #[test]
     fn infers_hikvision_sub_stream() {
-        let url = "rtsp://admin:pw@192.168.1.64:554/Streaming/Channels/101";
-        assert_eq!(
-            infer_sub_stream(url).as_deref(),
-            Some("rtsp://admin:pw@192.168.1.64:554/Streaming/Channels/102")
-        );
+        // The trailing 01 is the main stream and 02 the sub; the channel
+        // number in between may be one digit or several.
+        for (main, sub) in [
+            ("101", "102"),
+            ("201", "202"),
+            ("1001", "1002"),
+            ("1601", "1602"),
+            ("10101", "10102"),
+        ] {
+            let url = format!("rtsp://admin:pw@192.168.1.64:554/Streaming/Channels/{main}");
+            assert_eq!(
+                infer_sub_stream(&url).as_deref(),
+                Some(format!("rtsp://admin:pw@192.168.1.64:554/Streaming/Channels/{sub}").as_str()),
+                "{main} must infer {sub}"
+            );
+        }
+        // An address already ending in 02 is a sub stream: there is no
+        // further sub to derive from it, whatever the channel width.
+        for channel in ["102", "1002", "1602"] {
+            let url = format!("rtsp://admin:pw@192.168.1.64:554/Streaming/Channels/{channel}");
+            assert_eq!(infer_sub_stream(&url), None, "{channel} is already a sub");
+        }
+    }
+
+    #[test]
+    fn infers_sub_streams_from_other_vendor_urls() {
+        // The main side flips to the documented sub side. An address already
+        // on the sub side must never be flipped again.
+        for (main, sub) in [
+            (
+                "rtsp://u:p@10.0.0.2:554/Preview_01_main",
+                "rtsp://u:p@10.0.0.2:554/Preview_01_sub",
+            ),
+            (
+                "rtsp://u:p@10.0.0.2:554/h264Preview_03_main",
+                "rtsp://u:p@10.0.0.2:554/h264Preview_03_sub",
+            ),
+            (
+                "rtsp://u:p@10.0.0.2:554/h265Preview_01_main",
+                "rtsp://u:p@10.0.0.2:554/h264Preview_01_sub",
+            ),
+            (
+                "rtsp://u:p@10.0.0.2:554/h264/ch1/main/av_stream",
+                "rtsp://u:p@10.0.0.2:554/h264/ch1/sub/av_stream",
+            ),
+            (
+                "rtsp://10.0.0.2:554/user=admin&password=pw&channel=1&stream=0.sdp?",
+                "rtsp://10.0.0.2:554/user=admin&password=pw&channel=1&stream=1.sdp?",
+            ),
+            (
+                "rtsp://u:p@10.0.0.2:554/unicast/c12/s0/live",
+                "rtsp://u:p@10.0.0.2:554/unicast/c12/s1/live",
+            ),
+            (
+                "rtsp://u:p@10.0.0.2:554/media/video1",
+                "rtsp://u:p@10.0.0.2:554/media/video2",
+            ),
+            (
+                "rtsp://u:p@10.0.0.2:554/video?inst=1&rec=0",
+                "rtsp://u:p@10.0.0.2:554/video?inst=2&rec=0",
+            ),
+            (
+                "rtsp://u:p@10.0.0.2:554/live.sdp",
+                "rtsp://u:p@10.0.0.2:554/live2.sdp",
+            ),
+        ] {
+            assert_eq!(
+                infer_sub_stream(main).as_deref(),
+                Some(sub),
+                "{main} must infer {sub}"
+            );
+            assert_eq!(infer_sub_stream(sub), None, "{sub} is already a sub");
+        }
     }
 
     #[test]
@@ -1485,6 +1651,26 @@ mod tests {
         let camera = CameraSource::new("Front door", "rtsp://10.0.0.9:8554/live");
         assert_eq!(camera.host, "10.0.0.9");
         assert_eq!(camera.display_address(), "10.0.0.9:8554");
+    }
+
+    #[test]
+    fn the_next_stream_and_connection_are_read_without_changing_the_camera() {
+        let mut camera = CameraSource::new("Door", "rtsp://10.0.0.9/live").with_sub(
+            "rtsp://10.0.0.9/live/sub",
+        );
+        assert_eq!(camera.next_stream(), StreamKind::Main);
+        assert_eq!(camera.connection_stop(), ConnectionStop::RtspTcp);
+        assert_eq!(camera.next_connection(), ConnectionStop::RtspUdp);
+        assert_eq!(camera.connection_label_for(camera.next_connection()), "UDP");
+
+        camera.advance_stream();
+        assert_eq!(camera.grid_stream(), StreamKind::Main);
+        assert_eq!(camera.next_stream(), StreamKind::Sub);
+        camera.advance_stream();
+        assert_eq!(camera.grid_stream(), StreamKind::Sub);
+
+        camera.advance_connection();
+        assert_eq!(camera.next_connection(), ConnectionStop::RtspTcp);
     }
 
     #[test]

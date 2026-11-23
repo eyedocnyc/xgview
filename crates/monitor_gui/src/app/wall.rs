@@ -197,6 +197,7 @@ impl XgViewApp {
     pub fn modal_is_up(&self) -> bool {
         self.file_picker.is_open()
             || self.layout_picker.is_open()
+            || self.layout_editor.is_open()
             || self.portrait_aspect_picker.is_open()
             || self.combined_info_picker.is_open()
             || self.passphrase.is_open()
@@ -205,6 +206,29 @@ impl XgViewApp {
             || self.system_confirm.is_open()
             || self.download_panel.is_open()
             || self.discovery.open
+    }
+
+    /// Whether a dialog drawn ahead of the wall took this frame's press.
+    ///
+    /// The settings panel, the file picker and the donation dialog on the About
+    /// page are all painted before the wall, so the cross of either of the last
+    /// two is a primary click at a point inside the wall's area by the time the
+    /// dismissal below reads the raw queue. Both leave a one-frame answer: the
+    /// picker sets `file_dialog_answered`, the donation dialog keeps the frame
+    /// its cross was pressed in. A click that closed one of them must not also
+    /// close the settings they were opened from. The dialogs this application
+    /// owns are covered by `modal_is_up` instead - they are painted after the
+    /// wall, which has already decided by the time they close.
+    fn a_front_dialog_took_the_press(&self, ctx: &egui::Context) -> bool {
+        #[cfg(juanz)]
+        {
+            self.file_dialog_answered || crate::juanz::dismissed_this_frame(ctx)
+        }
+        #[cfg(not(juanz))]
+        {
+            let _ = ctx;
+            self.file_dialog_answered
+        }
     }
 
     /// Whether this frame *wants* the picture on the activity's surface, with
@@ -735,15 +759,15 @@ impl XgViewApp {
             // own idle and the bars'. Which bars are up does not come into
             // it. See `ring_shown`.
             focused: interactive && index == self.scheduler.focus() && ring,
-            interactive: interactive && !self.chrome.consume_primary,
+            interactive,
             dim: !interactive,
-            // Preserve every configured corner on a fault/reconnect and on
-            // recordings. Camera-burned labels are part of the video itself.
+            // Clean View takes every corner label with the bars when asked to;
+            // the centre status panel is feedback and stays. This never writes
+            // back to the saved OSD configuration.
             osd: grid::clean_view_osd(
                 self.config.osd,
                 self.clean_view_hidden(),
-                index.and_then(|index| self.view_channel(index)).map(|channel| channel.state),
-                index.and_then(|index| self.recording_mark(index)).is_some(),
+                self.config.clean_view_osd,
             ),
             combined: [
                 &self.config.combined_info[0],
@@ -807,6 +831,11 @@ impl XgViewApp {
         // Read once for the frame: the same answer for every tile, and it is the
         // frame's clock rather than each cell's turn at it.
         let ring = self.ring_shown();
+        // The picture-fit switch cycles the fit for the wall the viewer is
+        // looking at: upright uses its own fit, independent from the landscape
+        // one. Read it here so every tile's menu names the same field the press
+        // will advance.
+        let portrait = self.is_portrait();
 
         for (cell, index) in view.cells.iter().enumerate() {
             let rect = grid::tile_rect(origin, view.layout, cell, grid::LINE);
@@ -825,13 +854,90 @@ impl XgViewApp {
                 );
             let response = grid::paint(ui, rect, &tile);
             if interactive {
+                if let Some(camera_index) = *index {
+                    // Re-right-clicking the same tile while its menu is open
+                    // would otherwise close it on the same frame: egui sees a
+                    // click outside the old popup and applies CloseOnClickOutside
+                    // after the new position has been opened. Ignore that one
+                    // close so the menu simply moves to the new pointer.
+                    let moved_same_menu =
+                        response.secondary_clicked() && response.context_menu_opened();
+                    let menu = egui::Popup::context_menu(&response)
+                        // `Popup::menu` uses top_down_justified, whose
+                        // cross_justify stretches every item to the area's
+                        // full width. After the first sizing pass the area
+                        // remembers its size, so once a longer language (or a
+                        // tile with more items) made the menu wider, the
+                        // justified items keep reporting that remembered width
+                        // as their min_size and it never shrinks back. A plain
+                        // top_down layout sizes each item to its own text, so
+                        // the menu follows the current language on every open.
+                        .layout(egui::Layout::top_down(egui::Align::Min));
+                    let menu = if moved_same_menu {
+                        menu.close_behavior(egui::PopupCloseBehavior::IgnoreClicks)
+                    } else {
+                        menu
+                    };
+                    menu.show(|ui| {
+                        // A context menu starts with the narrow default menu
+                        // width, and labels such as "Picture fit: Fullscreen"
+                        // wrap onto a second line, making those items twice as
+                        // tall as the rest. Keep every item on one line and let
+                        // the menu grow to fit - the same fix the toast area
+                        // uses for text in a width-less container.
+                        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+                        if ui.button(monitor_i18n::tr("camera-context-edit")).clicked() {
+                            actions.edit_camera = Some(camera_index);
+                            ui.close();
+                        }
+                        if ui.button(monitor_i18n::tr("camera-context-delete")).clicked() {
+                            actions.delete_camera = Some(camera_index);
+                            ui.close();
+                        }
+                        let Some(camera) = cameras.get(camera_index) else {
+                            return;
+                        };
+                        // Name the stop the switch will move to, so a menu
+                        // press is not a guess. The next values are read
+                        // without changing the camera: the action below does
+                        // that once, after the whole wall has been painted.
+                        let fit = monitor_i18n::tr_args(
+                            "camera-context-picture-fit",
+                            &[("next", monitor_i18n::tr(camera.next_aspect(portrait).label()).into())],
+                        );
+                        if ui.button(fit).clicked() {
+                            actions.picture_fit = Some(camera_index);
+                            ui.close();
+                        }
+                        if camera.has_sub() {
+                            let stream = monitor_i18n::tr_args(
+                                "camera-context-stream",
+                                &[("next", monitor_i18n::tr(camera.next_stream().label()).into())],
+                            );
+                            if ui.button(stream).clicked() {
+                                actions.stream_change = Some(camera_index);
+                                ui.close();
+                            }
+                        }
+                        if !camera.is_ws_stream() {
+                            let connection = monitor_i18n::tr_args(
+                                "camera-context-connection",
+                                &[("next", camera.connection_label_for(camera.next_connection()).into())],
+                            );
+                            if ui.button(connection).clicked() {
+                                actions.connection_change = Some(camera_index);
+                                ui.close();
+                            }
+                        }
+                    });
+                }
+            }
+            if interactive {
                 if response.clicked() {
                     actions.focus = *index;
                     actions.click_pos = response.interact_pointer_pos();
                 }
-                if response.double_clicked()
-                    && ui.input(|input| input.time >= self.chrome.reveal_double_click_until)
-                {
+                if response.double_clicked() {
                     actions.zoom = *index;
                     actions.double_click_pos = response.interact_pointer_pos();
                 }
@@ -866,6 +972,36 @@ impl XgViewApp {
         // The band is what this frame paints, and no other frame's: a frame that
         // draws no wall has none to show. See [`Self::strip_band`].
         self.strip_band = None;
+        // Closing the settings panel from the wall is handled here, before
+        // any early return and before a tile can see the press. Returning
+        // without painting keeps a click meant only to dismiss the panel from
+        // also focusing or magnifying the picture underneath it.
+        //
+        // A primary click alone is not enough: the wall also paints each
+        // tile's context menu, and dialogs are shown over it, so a press on a
+        // menu item or on a dialog's button is a primary click at a point
+        // inside this area too. The raw queue sees those presses before the
+        // menu or dialog can claim them; closing the panel here and returning
+        // would then skip the very frame that would have run the menu item -
+        // the item does nothing and the panel shuts with it. While a popup or
+        // a window is up it owns the click: leave it alone and keep the panel.
+        //
+        // Two dialogs are painted before the wall, so they are gone by the time
+        // this reads the press: the file picker and the donation dialog on the
+        // About page. Each leaves a one-frame answer for exactly this, or a
+        // click on its cross would also shut the settings it was opened from.
+        if self.show_settings
+            && !self.modal_is_up()
+            && !self.a_front_dialog_took_the_press(ui.ctx())
+            && !egui::Popup::is_any_open(ui.ctx())
+            && ui.ctx().input(|input| {
+                input.pointer.button_clicked(egui::PointerButton::Primary)
+                    && input.pointer.interact_pos().is_some_and(|pos| area.contains(pos))
+            })
+        {
+            self.show_settings = false;
+            return;
+        }
         if area.width() < 24.0 || area.height() < 24.0 {
             return;
         }
@@ -1134,6 +1270,63 @@ impl XgViewApp {
 
         let mut actions = self.paint_view(ui, picture_area, &cameras, &view, dx, true, 2);
 
+        if actions.edit_camera.is_some() || actions.delete_camera.is_some() {
+            let slots = self.config.active_slots();
+
+            if let Some(index) = actions.edit_camera {
+                if let Some(&slot) = slots.get(index) {
+                    if let Some(draft) = self.config.cameras.get(slot).map(CameraDraft::from_source) {
+                        self.camera_edit.open(CameraEdit { slot, draft });
+                        self.camera_edit.from = None;
+                    }
+                }
+            } else if let Some(index) = actions.delete_camera {
+                if let Some(&slot) = slots.get(index) {
+                    if let Some(camera) = self.config.cameras.get(slot) {
+                        self.remove_confirm.open(RemoveConfirm {
+                            slot,
+                            name: camera.name.clone(),
+                        });
+                        self.remove_confirm.from = None;
+                    }
+                }
+            }
+        }
+
+        if actions.picture_fit.is_some()
+            || actions.stream_change.is_some()
+            || actions.connection_change.is_some()
+        {
+            let slots = self.config.active_slots();
+            if let Some(index) = actions.picture_fit {
+                if let Some(&slot) = slots.get(index) {
+                    let portrait = self.is_portrait();
+                    if let Some(camera) = self.config.cameras.get_mut(slot) {
+                        camera.advance_aspect(portrait);
+                    }
+                    self.mark_dirty();
+                }
+            }
+            if let Some(index) = actions.stream_change {
+                if let Some(&slot) = slots.get(index) {
+                    if let Some(camera) = self.config.cameras.get_mut(slot) {
+                        camera.advance_stream();
+                    }
+                    self.needs_sync = true;
+                    self.mark_dirty();
+                }
+            }
+            if let Some(index) = actions.connection_change {
+                if let Some(&slot) = slots.get(index) {
+                    if let Some(camera) = self.config.cameras.get_mut(slot) {
+                        camera.advance_connection();
+                    }
+                    self.needs_sync = true;
+                    self.mark_dirty();
+                }
+            }
+        }
+
         // A drag on the magnified picture is the picture moving, not the page:
         // the wall has one picture on it and nowhere to turn to, and the channel
         // after it is reached from the toolbar's arrows or the page keys, which
@@ -1230,9 +1423,6 @@ impl XgViewApp {
         dx: f32,
         actions: &TileActions,
     ) -> bool {
-        if self.chrome.consume_primary {
-            return true;
-        }
         if !self.scheduler.is_zoomed() {
             return false;
         }
@@ -2294,6 +2484,135 @@ fn paint_band(painter: &egui::Painter, bar: Rect) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_second_right_click_moves_the_same_menu() {
+        let source = include_str!("wall.rs");
+        let opened = format!("{}.{}()", "response", "context_menu_opened");
+        assert!(source.contains(&opened), "the menu knows it is already open");
+        assert!(
+            source.contains("PopupCloseBehavior::IgnoreClicks"),
+            "that frame must not close the menu it just moved"
+        );
+    }
+
+    #[test]
+    fn context_menu_names_the_next_stop_without_mutating_the_camera() {
+        let source = include_str!("wall.rs");
+        for key in [
+            "camera-context-picture-fit",
+            "camera-context-stream",
+            "camera-context-connection",
+        ] {
+            assert!(source.contains(key), "missing context entry: {key}");
+        }
+        let lookup = format!("cameras.get({})", "camera_index");
+        assert!(source.contains(&lookup), "the menu reads the camera it names");
+        // The label shown and the fit advanced must both follow the wall's
+        // orientation: upright has its own fit, independent from landscape.
+        assert!(
+            source.contains("camera.next_aspect(portrait).label()"),
+            "the menu must name the next fit for the orientation on screen"
+        );
+        assert!(
+            source.contains("camera.advance_aspect(portrait)"),
+            "the press must advance the fit whose next value the menu named"
+        );
+        assert!(
+            source.contains("let portrait = self.is_portrait();"),
+            "the frame must read the orientation the fit switch follows"
+        );
+    }
+
+    #[test]
+    fn context_menu_items_stay_on_one_line() {
+        let source = include_str!("wall.rs");
+        let show = source.find("menu.show(|ui| {").unwrap();
+        let items = &source[show..];
+        let first_button = items.find("ui.button(").unwrap();
+        let before_buttons = &items[..first_button];
+        assert!(
+            before_buttons.contains("TextWrapMode::Extend"),
+            "the menu must keep its items from wrapping before the first button"
+        );
+    }
+
+    #[test]
+    fn context_menu_does_not_justify_items_to_a_remembered_width() {
+        let source = include_str!("wall.rs");
+        let menu = source.find("egui::Popup::context_menu(&response)").unwrap();
+        let show = source[menu..].find("menu.show(|ui| {").unwrap() + menu;
+        let setup = &source[menu..show];
+        assert!(
+            setup.contains(".layout(egui::Layout::top_down(egui::Align::Min))"),
+            "cross_justify off: the menu must size to the current text, not the last remembered width"
+        );
+        assert!(
+            !setup.contains(".layout(egui::Layout::top_down_justified"),
+            "a justified layout would pin item width to the remembered area size"
+        );
+    }
+
+    #[test]
+    fn settings_dismiss_precedes_the_early_returns() {
+        let source = include_str!("wall.rs");
+        let draw = source.find("pub(super) fn draw_grid").unwrap();
+        let tail = &source[draw..];
+        let dismiss = tail.find("self.show_settings = false;").unwrap();
+        let empty_wall = tail.find("if total == 0").unwrap();
+        assert!(
+            dismiss < empty_wall,
+            "a click on an empty wall must also close the settings panel"
+        );
+    }
+
+    #[test]
+    fn a_popup_or_window_keeps_the_settings_panel_open() {
+        // The dismiss reads raw primary clicks, which cannot tell a bare wall
+        // from a menu item or a dialog button. A popup (the tile context menu)
+        // or a window (the edit / remove dialogs) owns the click while it is
+        // up, so neither may fall through to the panel dismissal.
+        let source = include_str!("wall.rs");
+        let draw = source.find("pub(super) fn draw_grid").unwrap();
+        let dismiss = &source[draw..];
+        let dismiss = &dismiss[..dismiss.find("self.show_settings = false;").unwrap()];
+        assert!(
+            dismiss.contains("!self.modal_is_up()"),
+            "a dialog's button must not also close the settings panel"
+        );
+        assert!(
+            dismiss.contains("!egui::Popup::is_any_open(ui.ctx())"),
+            "a context menu item must not also close the settings panel"
+        );
+    }
+
+    #[test]
+    fn a_front_dialogs_cross_keeps_the_settings_panel_open() {
+        // The file picker and the donation dialog are both painted before the
+        // wall, so their cross is gone by the time the wall reads the raw
+        // primary click. The dismissal has to be told the press was spent, or
+        // shutting one of them shuts the settings panel behind it too.
+        let source = include_str!("wall.rs");
+        let draw = source.find("pub(super) fn draw_grid").unwrap();
+        let dismiss = &source[draw..];
+        let dismiss = &dismiss[..dismiss.find("self.show_settings = false;").unwrap()];
+        assert!(
+            dismiss.contains("!self.a_front_dialog_took_the_press(ui.ctx())"),
+            "a front dialog's cross must not also close the settings panel"
+        );
+
+        let guard = source.find("fn a_front_dialog_took_the_press").unwrap();
+        let guard = &source[guard..];
+        let guard = &guard[..guard.find("\n    }\n").unwrap()];
+        assert!(
+            guard.contains("self.file_dialog_answered"),
+            "the file picker's one-frame answer must be honoured"
+        );
+        assert!(
+            guard.contains("crate::juanz::dismissed_this_frame(ctx)"),
+            "the donation dialog's one-frame answer must be honoured"
+        );
+    }
 
     /// The band the strip stands in is as deep as the panel asks, never more
     /// than half the area, and the picture has everything above it: the whole

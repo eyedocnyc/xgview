@@ -30,6 +30,22 @@ use crate::icons::{self, Icon};
 use crate::nav::{Kind, Nav};
 use crate::theme;
 
+/// The width a modal is actually laid out at, given the width it asks for and
+/// the screen it has to fit on. A form built for a television can be several
+/// hundred points wide, which overhangs both edges of a 360pt upright phone.
+/// Landscape screens are wider than every request, so they keep the requested
+/// width unchanged; only a screen narrower than the request plus its margins is
+/// pulled in. The margin is only enough to keep the window off the screen edge
+/// - an upright phone needs every point it can get. The floor keeps a form
+/// usable, but never wider than the screen itself.
+pub(crate) fn modal_width(requested: f32, screen_width: f32) -> f32 {
+    const MARGIN: f32 = 12.0;
+    const FLOOR: f32 = 260.0;
+    let room = (screen_width - 2.0 * MARGIN).max(0.0);
+    let floor = FLOOR.min(room);
+    requested.min(room).max(floor)
+}
+
 /// Key under which the text field being typed into leaves a copy of its text
 /// for the floating input box (Android); see [`text_field`].
 pub const MIRROR: &str = "xg-input-mirror";
@@ -201,6 +217,15 @@ pub enum BackgroundEvent {
     /// progress event may already be in the queue; the id says it is not the
     /// current one's.
     DownloadProgress { id: u64, progress: Progress },
+    /// Whether a Frigate camera is recording, from the periodic segment read.
+    ///
+    /// `active` is `None` when the box could not be asked: the receiver keeps
+    /// its last answer then, rather than showing a camera that is recording as
+    /// one that stopped because the network blinked.
+    RecordingStatus {
+        camera_id: String,
+        active: Option<bool>,
+    },
     /// A clip arrived whole and has its final name on disk.
     DownloadDone { id: u64, path: String },
     /// A clip could not be saved. The reason is shown once, as a toast.
@@ -355,8 +380,6 @@ impl CameraDraft {
         let sub = self.sub.trim();
         if !sub.is_empty() {
             source.rtsp_sub = Some(sub.to_string());
-        } else if self.infer_sub {
-            source.apply_sub_inference();
         }
         // The MSE address and its own login, when the entry carries them.
         let mse_main = self.mse_main.trim();
@@ -391,13 +414,174 @@ impl CameraDraft {
             password: camera.password.clone().unwrap_or_default(),
             mse_username: camera.mse_username.clone().unwrap_or_default(),
             mse_password: camera.mse_password.clone().unwrap_or_default(),
-            // A sub stream already there is not to be overwritten by inference.
+            // An existing sub stream is shown as typed, so leave the field
+            // editable. One without starts in inference mode, showing what the
+            // main url would derive until the viewer unticks it.
             infer_sub: camera.rtsp_sub.is_none(),
             talk: camera.talk,
         }
     }
 }
 
+/// Parameters for adding multiple RTSP cameras from one recorder.
+#[derive(Debug, Clone)]
+pub struct BulkCameraDraft {
+    pub name_prefix: String,
+    pub main_template: String,
+    pub sub_template: String,
+    pub username: String,
+    pub password: String,
+    /// Channel numbers to generate, as `1-4,7,9-11`. Replaces the old
+    /// first/count/step triple: real recorders rarely number every channel
+    /// with one arithmetic step.
+    pub channels: String,
+    pub infer_sub: bool,
+}
+
+impl Default for BulkCameraDraft {
+    fn default() -> Self {
+        Self {
+            name_prefix: String::new(),
+            main_template: String::new(),
+            sub_template: String::new(),
+            username: String::new(),
+            password: String::new(),
+            channels: "1-16".into(),
+            infer_sub: true,
+        }
+    }
+}
+/// Expand `1-4,7,9-11` into channel numbers. Duplicates are dropped in the
+/// order they appear, so a pasted list cannot import the same stream twice in
+/// one batch. The 256-entry cap matches the old count limit.
+fn parse_channels(spec: &str) -> Result<Vec<usize>, String> {
+    let invalid = || monitor_i18n::tr("dialog-bulk-error-channels");
+    let mut numbers = Vec::new();
+    for token in spec.split(',') {
+        let token = token.trim();
+        if token.is_empty() {
+            return Err(invalid());
+        }
+        if let Some((first, last)) = token.split_once('-') {
+            let first = first.trim().parse::<usize>().map_err(|_| invalid())?;
+            let last = last.trim().parse::<usize>().map_err(|_| invalid())?;
+            if first > last {
+                return Err(invalid());
+            }
+            for number in first..=last {
+                if number > 65535 || numbers.len() >= 256 {
+                    return Err(invalid());
+                }
+                if !numbers.contains(&number) {
+                    numbers.push(number);
+                }
+            }
+        } else {
+            let number = token.parse::<usize>().map_err(|_| invalid())?;
+            if number > 65535 || numbers.len() >= 256 {
+                return Err(invalid());
+            }
+            if !numbers.contains(&number) {
+                numbers.push(number);
+            }
+        }
+    }
+    if numbers.is_empty() {
+        return Err(invalid());
+    }
+    Ok(numbers)
+}
+
+impl BulkCameraDraft {
+    pub fn build(&self) -> Result<Vec<CameraSource>, String> {
+        let channels = parse_channels(&self.channels)?;
+        if !self.main_template.contains("{n}") {
+            return Err(monitor_i18n::tr("dialog-bulk-error-main-template"));
+        }
+        if !self.sub_template.trim().is_empty()
+            && !self.sub_template.contains("{n}")
+        {
+            return Err(monitor_i18n::tr("dialog-bulk-error-sub-template"));
+        }
+
+        let mut cameras = Vec::with_capacity(channels.len());
+        // One checkbox speaks for the whole batch, and the form offers it when
+        // any channel has a rule. Derive only while that offer is on screen;
+        // each channel then takes its own address where a rule matches and
+        // none where it does not, so no camera gets an unseen address.
+        let derive = self.can_infer_sub() && self.infer_sub;
+
+        for number in channels {
+            let prefix = self.name_prefix.trim();
+            let name = if prefix.is_empty() {
+                monitor_i18n::tr_args("dialog-bulk-camera-name", &[("number", format!("{:02}", number).into())])
+            } else {
+                monitor_i18n::tr_args("dialog-bulk-camera-name-prefixed", &[("prefix", prefix.into()), ("number", format!("{:02}", number).into())])
+            };
+
+            let main = self.main_template.replace("{n}", &number.to_string());
+            // The bulk form has no drawn `CameraDraft` field to fill from the
+            // main url, so the checkbox has to be resolved here. A template
+            // wins whenever one was typed; with neither a template nor the
+            // checkbox there is simply no sub stream.
+            let sub = if derive {
+                infer_sub_stream(&main).unwrap_or_default()
+            } else {
+                self.sub_template.replace("{n}", &number.to_string())
+            };
+            let draft = CameraDraft {
+                name,
+                main,
+                sub,
+                username: self.username.clone(),
+                password: self.password.clone(),
+                infer_sub: false,
+                ..Default::default()
+            };
+
+            cameras.push(draft.build()?);
+        }
+
+        Ok(cameras)
+    }
+
+    /// How many cameras the Add button will create, or zero while the channel
+    /// specification is being edited and cannot be parsed yet.
+    pub fn channel_count(&self) -> usize {
+        parse_channels(&self.channels).map_or(0, |channels| channels.len())
+    }
+
+    /// The first channel for the URL example under the form.
+    pub fn first_channel(&self) -> usize {
+        parse_channels(&self.channels)
+            .ok()
+            .and_then(|channels| channels.first().copied())
+            .unwrap_or(1)
+    }
+
+    /// Whether the derive-sub checkbox has anything to derive on this form.
+    /// The single-camera form only offers the check when its main url matches
+    /// a rule; the bulk form has to ask the same question of its template, or
+    /// the offer would promise an address the builder cannot produce.
+    pub fn can_infer_sub(&self) -> bool {
+        if !self.sub_template.trim().is_empty() || !self.main_template.contains("{n}") {
+            return false;
+        }
+        let channels = match parse_channels(&self.channels) {
+            Ok(channels) if !channels.is_empty() => channels,
+            _ => return false,
+        };
+        // One checkbox speaks for the whole batch, so it is offered when any
+        // channel it will create has a rule to follow. Channels without one
+        // simply get no sub. The channel list may mix main and sub addresses
+        // (a `{n}` of `101,102` for instance), and only the mains have a rule;
+        // requiring every value to match would hide the check on such a batch.
+        channels.iter().any(|number| {
+            let main = self.main_template.replace("{n}", &number.to_string());
+            infer_sub_stream(&main).is_some()
+        })
+    }
+}
 /// State of the "Add devices" window.
 #[derive(Debug, Default)]
 pub struct DiscoveryUi {
@@ -416,7 +600,12 @@ pub struct DiscoveryUi {
     /// to ("on Surveillance Station", "in Frigate"), so it is only drawn on that tab.
     pub error: Option<(Tab, String)>,
     pub message: Option<(Tab, String)>,
+    /// An error from a press inside this dialog that the app should also show
+    /// as a toast. Background failures already get one in the event loop, so
+    /// only the synchronous form paths set this.
+    pub toast_error: Option<String>,
     pub manual: CameraDraft,
+    pub bulk: BulkCameraDraft,
     /// The manual tab's test button, which needs the runtime the dialog has not
     /// got: the application picks it up after drawing the dialog and plays the
     /// tone the way the edit window's button does.
@@ -515,6 +704,8 @@ impl DiscoveryUi {
             BackgroundEvent::SegmentsReady { .. } => {}
             BackgroundEvent::DaysReady { .. } => {}
             BackgroundEvent::EventsReady { .. } => {}
+            // A camera's recording state belongs on its tile, not in a panel.
+            BackgroundEvent::RecordingStatus { .. } => {}
             // A saved clip is answered by the wall's download state, not by a
             // device panel.
             BackgroundEvent::DownloadProgress { .. } => {}
@@ -781,6 +972,7 @@ pub fn add_devices_window(
     handle: &Handle,
     events: &Sender<BackgroundEvent>,
     nav: &mut Nav,
+    body_scroll: &mut Option<f32>,
 ) -> bool {
     let mut changed = false;
     let mut close = false;
@@ -790,7 +982,7 @@ pub fn add_devices_window(
     // stayed live underneath, so a second press on "Add devices" toggled the
     // dialog shut and the settings panel could be rearranged from under it.
     egui::Modal::new(egui::Id::new("xgview-add-devices")).show(ctx, |ui| {
-        ui.set_width(620.0);
+        ui.set_width(modal_width(620.0, ctx.screen_rect().width()));
         // The title row carries the way out, the way the layout picker's does:
         // a cross at the far end, for a mouse or a finger. It is deliberately
         // not registered with the navigation layer - a remote leaves the dialog
@@ -826,12 +1018,20 @@ pub fn add_devices_window(
         egui::ScrollArea::vertical()
             .max_height(420.0)
             .auto_shrink([false, false])
-            .show(ui, |ui| match state.tab {
-                Tab::Onvif => changed |= onvif_tab(ui, state, config, handle, events, nav),
-                Tab::Manual => changed |= manual_tab(ui, state, config, nav),
-                Tab::Synology => changed |= synology_tab(ui, state, config, handle, events, nav),
-                Tab::Frigate => changed |= frigate_tab(ui, state, config, handle, events, nav),
-                Tab::Go2rtc => changed |= go2rtc_tab(ui, state, config, handle, events, nav),
+            .show(ui, |ui| {
+                // A Down off the last control has nowhere else to go. The
+                // settings panel spends the same request from its scroll area;
+                // here it lets a remote reach the far end of a long form.
+                if let Some(points) = body_scroll.take() {
+                    ui.scroll_with_delta(egui::vec2(0.0, -points));
+                }
+                match state.tab {
+                    Tab::Onvif => changed |= onvif_tab(ui, state, config, handle, events, nav),
+                    Tab::Manual => changed |= manual_tab(ui, state, config, nav),
+                    Tab::Synology => changed |= synology_tab(ui, state, config, handle, events, nav),
+                    Tab::Frigate => changed |= frigate_tab(ui, state, config, handle, events, nav),
+                    Tab::Go2rtc => changed |= go2rtc_tab(ui, state, config, handle, events, nav),
+                }
             });
         nav.close();
     });
@@ -1079,8 +1279,6 @@ fn onvif_tab(
 pub struct CameraFields {
     /// The first control of the form, for a window that opens on it.
     pub first: Option<egui::Id>,
-    /// Whether the "Infer" button was pressed.
-    pub inferred: bool,
     /// Whether the "Detach" button was pressed - the camera is to leave the
     /// import's hands, its addresses becoming editable by hand.
     pub detach: bool,
@@ -1103,6 +1301,15 @@ fn field_text(
         ui.add_enabled(false, build(text))
     } else {
         text_field(ui, nav, text, label, false, false, build)
+    }
+}
+
+/// A hidden infer check still remembers having been ticked. When its rule is
+/// gone and the viewer types over the address it left behind, that address is
+/// theirs: the check must not come back later and grey it away.
+fn keep_a_hand_typed_sub(infer_ok: bool, changed: bool, infer_sub: &mut bool) {
+    if !infer_ok && changed {
+        *infer_sub = false;
     }
 }
 
@@ -1129,7 +1336,6 @@ pub fn camera_fields(
 ) -> CameraFields {
     let locked = camera.is_some_and(|camera| camera.imported);
     let mut first = None;
-    let mut inferred = false;
     let mut detach = false;
     let mut test = false;
     // The MSE rows appear only when the entry carries an MSE address: an
@@ -1164,22 +1370,41 @@ pub fn camera_fields(
         ui.end_row();
 
         ui.label(monitor_i18n::tr("dialog-sub-stream"));
-        ui.horizontal(|ui| {
-            field_text(ui, nav, &mut draft.sub, &monitor_i18n::tr("dialog-sub-stream"), locked, |s| {
+        // The sub field fills its column like the name and main fields do, so
+        // all three share one right edge. Ticking "derive sub" fills this field
+        // with the address read off the main url and locks it grey; unticking
+        // keeps that address and makes the field editable again. If the main
+        // url stops matching a rule, the check goes away and the last derived
+        // address stays visible and editable; typing over it makes the address
+        // the viewer's own, so a rule matching again later cannot take it back.
+        // Nothing is inferred at save time - what is shown is what gets saved.
+        if !locked && infer_ok && draft.infer_sub {
+            // Keep the field equal to the derived address for as long as the
+            // check is on - including the frame the main url first becomes
+            // inferable, so a default-checked form is never an empty grey box.
+            // Unticking stops the write and leaves this address editable.
+            if let Some(derived) = infer_sub_stream(&draft.main) {
+                draft.sub = derived;
+            }
+            let mut sub = draft.sub.as_str();
+            ui.add_enabled(
+                false,
+                egui::TextEdit::singleline(&mut sub)
+                    .hint_text(theme::hint(&monitor_i18n::tr("dialog-sub-hint")))
+                    .desired_width(f32::INFINITY),
+            );
+        } else {
+            let sub = field_text(ui, nav, &mut draft.sub, &monitor_i18n::tr("dialog-sub-stream"), locked, |s| {
                 egui::TextEdit::singleline(s)
                     .hint_text(theme::hint(&monitor_i18n::tr(sub_hint)))
-                    .desired_width(320.0)
+                    .desired_width(f32::INFINITY)
             });
-            if !locked && infer_ok && nav.tracked(ui.button(monitor_i18n::tr("dialog-infer"))).clicked() {
-                draft.infer_sub = true;
-                inferred = true;
-                let mut probe = draft.clone();
-                probe.sub.clear();
-                if let Ok(source) = probe.build() {
-                    draft.sub = source.rtsp_sub.unwrap_or_default();
-                }
-            }
-        });
+            // The check may still be set from a frame when a rule applied.
+            // Editing the visible field while no rule applies makes that
+            // address manual; otherwise a rule coming back would grey the
+            // field again and quietly replace what the viewer just typed.
+            keep_a_hand_typed_sub(infer_ok, sub.changed(), &mut draft.infer_sub);
+        }
         ui.end_row();
 
         // The MSE address the import also captured, so both halves of the pair
@@ -1195,7 +1420,7 @@ pub fn camera_fields(
 
             ui.label(monitor_i18n::tr("dialog-mse-sub"));
             field_text(ui, nav, &mut draft.mse_sub, &monitor_i18n::tr("dialog-mse-sub"), locked, |s| {
-                egui::TextEdit::singleline(s).desired_width(320.0)
+                egui::TextEdit::singleline(s).desired_width(f32::INFINITY)
             });
             ui.end_row();
         }
@@ -1249,7 +1474,7 @@ pub fn camera_fields(
         }
     }
 
-    CameraFields { first, inferred, detach, test }
+    CameraFields { first, detach, test }
 }
 
 /// A credentials row, editable or greyed - the shape a managed camera's account
@@ -1275,12 +1500,17 @@ fn credentials_fields(
     }
 }
 
+/// A stream is a duplicate only within the group currently being edited.
+fn bulk_camera_exists(config: &AppConfig, source: &CameraSource) -> bool {
+    let active_group = config.active_index();
+    config.cameras.iter().any(|known| {
+        usize::from(known.group) == active_group
+            && known.rtsp_main == source.rtsp_main
+    })
+}
 fn manual_tab(ui: &mut egui::Ui, state: &mut DiscoveryUi, config: &mut AppConfig, nav: &mut Nav) -> bool {
     let mut changed = false;
     let fields = camera_fields(ui, nav, "manual-camera", &mut state.manual, None);
-    if fields.inferred {
-        state.note(Tab::Manual, monitor_i18n::tr("dialog-sub-derived-msg"));
-    }
     // The dialog has no runtime to play a tone with, so the press is handed
     // back to the application, which plays it like the edit window's button.
     if fields.test {
@@ -1302,7 +1532,10 @@ fn manual_tab(ui: &mut egui::Ui, state: &mut DiscoveryUi, config: &mut AppConfig
                     state.note(Tab::Manual, monitor_i18n::tr("dialog-camera-added"));
                     changed = true;
                 }
-                Err(err) => state.fail(Tab::Manual, err),
+                Err(err) => {
+                    state.fail(Tab::Manual, err.clone());
+                    state.toast_error = Some(err);
+                },
             }
         }
         if nav.tracked(ui.button(monitor_i18n::tr("dialog-clear"))).clicked() {
@@ -1310,6 +1543,91 @@ fn manual_tab(ui: &mut egui::Ui, state: &mut DiscoveryUi, config: &mut AppConfig
         }
     });
 
+    ui.add_space(theme::space::M);
+    ui.separator();
+    ui.label(monitor_i18n::tr("dialog-bulk-title"));
+    ui.label(
+        RichText::new(monitor_i18n::tr("dialog-bulk-hint"))
+            .small()
+            .color(theme::TEXT_DIM),
+    );
+
+    ui.label(monitor_i18n::tr("dialog-bulk-recorder-name"));
+    text_field(ui, nav, &mut state.bulk.name_prefix, &monitor_i18n::tr("dialog-bulk-recorder-name"), false, false, |s| {
+        egui::TextEdit::singleline(s)
+            .desired_width(f32::INFINITY)
+            .hint_text(theme::hint(&monitor_i18n::tr("dialog-bulk-recorder-placeholder")))
+    });
+
+    ui.label(monitor_i18n::tr("dialog-bulk-main-template"));
+    text_field(ui, nav, &mut state.bulk.main_template, &monitor_i18n::tr("dialog-bulk-main-template"), false, false, |s| {
+        egui::TextEdit::singleline(s)
+            .desired_width(f32::INFINITY)
+            .hint_text(theme::hint("rtsp://192.168.1.100/Streaming/Channels/{n}01"))
+    });
+
+    ui.label(monitor_i18n::tr("dialog-bulk-sub-template"));
+    text_field(ui, nav, &mut state.bulk.sub_template, &monitor_i18n::tr("dialog-bulk-sub-template"), false, false, |s| {
+        egui::TextEdit::singleline(s)
+            .desired_width(f32::INFINITY)
+            .hint_text(theme::hint("rtsp://192.168.1.100/Streaming/Channels/{n}02"))
+    });
+    // With no template typed, the sub addresses can be read off the main
+    // template instead, but only when that template has a rule to follow.
+    // Keep the offer next to the field it stands in for.
+    if state.bulk.can_infer_sub() {
+        nav.tracked(ui.checkbox(&mut state.bulk.infer_sub, monitor_i18n::tr("dialog-bulk-infer-sub")));
+    }
+
+    ui.label(RichText::new(monitor_i18n::tr("dialog-bulk-credentials")).small());
+    credentials_row(ui, nav, &mut state.bulk.username, &mut state.bulk.password);
+
+    ui.label(monitor_i18n::tr("dialog-bulk-channels"));
+    text_field(ui, nav, &mut state.bulk.channels, &monitor_i18n::tr("dialog-bulk-channels"), false, false, |s| {
+        egui::TextEdit::singleline(s)
+            .desired_width(f32::INFINITY)
+            .hint_text(theme::hint("1-16, 20, 23-24"))
+    });
+
+    if !state.bulk.main_template.trim().is_empty() {
+        let first_url = state.bulk.main_template
+            .replace("{n}", &state.bulk.first_channel().to_string());
+        ui.label(RichText::new(monitor_i18n::tr_args("dialog-bulk-example", &[("url", first_url.into())]))
+            .small()
+            .color(theme::TEXT_DIM));
+    }
+
+    let button_label = monitor_i18n::tr_args("dialog-bulk-add", &[("count", state.bulk.channel_count().into())]);
+    if nav.tracked(ui.button(button_label)).clicked() {
+        match state.bulk.build() {
+            Ok(cameras) => {
+                let mut added = 0usize;
+                let mut skipped = 0usize;
+
+                for source in cameras {
+                    let duplicate = bulk_camera_exists(config, &source);
+
+                    if duplicate {
+                        skipped += 1;
+                    } else {
+                        config.upsert_camera(source);
+                        added += 1;
+                    }
+                }
+
+                state.clear_status(Tab::Manual);
+                state.note(
+                    Tab::Manual,
+                    monitor_i18n::tr_args("dialog-bulk-result", &[("added", added.into()), ("skipped", skipped.into())]),
+                );
+                changed |= added > 0;
+            }
+            Err(err) => {
+                state.fail(Tab::Manual, err.clone());
+                state.toast_error = Some(err);
+            },
+        }
+    }
     status_lines(ui, state, Tab::Manual);
     changed
 }
@@ -1974,11 +2292,16 @@ fn go2rtc_tab(
 /// to ("on Surveillance Station", "in Frigate"), so anything tagged with another tab is left
 /// out rather than read where it does not apply.
 fn status_lines(ui: &mut egui::Ui, state: &DiscoveryUi, tab: Tab) {
+    let message = state.message.as_ref().filter(|(other, _)| *other == tab);
+    let error = state.error.as_ref().filter(|(other, _)| *other == tab);
+    if message.is_none() && error.is_none() {
+        return;
+    }
     ui.add_space(8.0);
-    if let Some((_, message)) = state.message.as_ref().filter(|(other, _)| *other == tab) {
+    if let Some((_, message)) = message {
         ui.label(RichText::new(message).color(theme::LIVE));
     }
-    if let Some((_, error)) = state.error.as_ref().filter(|(other, _)| *other == tab) {
+    if let Some((_, error)) = error {
         ui.label(RichText::new(error).color(theme::ERROR));
     }
 }
@@ -1990,6 +2313,367 @@ fn grid_spinner(ui: &mut egui::Ui) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_camera_address_field_fills_its_column() {
+        let source = include_str!("dialogs.rs");
+        let form = source.find("pub fn camera_fields").unwrap();
+        let end = source[form..].find("fn credentials_fields").unwrap() + form;
+        let body = &source[form..end];
+        // Name, main, sub (editable and derived) and both MSE addresses all
+        // stretch to the column's width, so their right edges line up.
+        assert_eq!(
+            body.matches("desired_width(f32::INFINITY)").count(),
+            6,
+            "name, main, sub (both forms) and both MSE fields must fill their column"
+        );
+        // While checked the field is kept equal to the derived address and
+        // locked grey; build() saves whatever is in the field, so nothing is
+        // inferred at save time and unticking keeps the address to edit.
+        assert!(
+            body.contains("draft.sub = derived"),
+            "the checked field must be filled from the main url"
+        );
+        assert!(
+            body.contains("infer_sub_stream(&draft.main)"),
+            "the address filled while checked comes from the main url"
+        );
+        assert!(
+            body.contains("let mut sub = draft.sub.as_str()"),
+            "the grey field shows the stored address, not a fresh preview"
+        );
+        assert!(
+            body.contains("ui.add_enabled(\n                false,"),
+            "the derived address must be greyed and read-only"
+        );
+        assert!(
+            !body.contains("dialog-infer"),
+            "the Infer button is gone; the check does its job"
+        );
+        assert!(
+            body.contains("infer_ok && draft.infer_sub"),
+            "the grey field shows only where the check is drawn"
+        );
+        assert!(
+            body.contains("keep_a_hand_typed_sub(infer_ok, sub.changed(), &mut draft.infer_sub)"),
+            "typing over a hidden check must make the address manual on the form"
+        );
+    }
+
+    #[test]
+    fn a_background_failure_keeps_its_one_toast() {
+        let mut state = DiscoveryUi::default();
+        assert!(state.toast_error.is_none());
+        state.fail(Tab::Synology, "already toasted by the event loop");
+        assert!(state.toast_error.is_none(), "fail() alone must not flash twice");
+    }
+
+    #[test]
+    fn form_errors_in_the_devices_dialog_ask_for_a_toast() {
+        let source = include_str!("dialogs.rs");
+        let call = format!("state.toast_error = Some({});", "err");
+        assert_eq!(
+            source.matches(&call).count(),
+            2,
+            "manual add and bulk add both answer a press with a toast"
+        );
+    }
+
+    #[test]
+    fn the_bulk_form_uses_the_existing_label_and_hint_styles() {
+        let source = include_str!("dialogs.rs");
+        let plain_title = format!("ui.label(monitor_i18n::tr(\"{}\"));", "dialog-bulk-title");
+        assert!(
+            source.contains(&plain_title),
+            "the section title uses the same plain label as the field names"
+        );
+        assert!(
+            source.contains("RichText::new(monitor_i18n::tr(\"dialog-bulk-credentials\")).small()"),
+            "the credentials caption matches the other tabs"
+        );
+        assert!(
+            source.contains("theme::hint(") && source.contains("dialog-bulk-recorder-placeholder"),
+            "placeholders use the dialog's dimmed hint colour"
+        );
+        assert!(
+            !source.contains("text_field(ui, nav, &mut state.bulk.name_prefix, \"bulk-camera-name\""),
+            "the Android mirror needs the localized field label"
+        );
+    }
+
+    #[test]
+    fn bulk_cameras_resolve_the_inference_checkbox_when_building() {
+        let main_template = "rtsp://192.168.1.100/Streaming/Channels/{n}01".to_owned();
+        let derived = "rtsp://192.168.1.100/Streaming/Channels/102";
+
+        let draft = BulkCameraDraft {
+            main_template: main_template.clone(),
+            channels: "1".into(),
+            infer_sub: true,
+            ..Default::default()
+        };
+        let cameras = draft.build().unwrap();
+        assert_eq!(cameras.len(), 1);
+        assert_eq!(cameras[0].rtsp_sub.as_deref(), Some(derived));
+        assert!(draft.can_infer_sub(), "the offer is made where a rule applies");
+
+        let without = BulkCameraDraft { infer_sub: false, ..draft.clone() };
+        assert!(
+            without.build().unwrap()[0].rtsp_sub.is_none(),
+            "an unticked box leaves the camera without a sub stream"
+        );
+
+        let typed = BulkCameraDraft {
+            sub_template: "rtsp://192.168.1.100/channel/{n}/sub".into(),
+            ..draft.clone()
+        };
+        assert!(!typed.can_infer_sub(), "a typed template replaces the offer");
+        assert_eq!(
+            typed.build().unwrap()[0].rtsp_sub.as_deref(),
+            Some("rtsp://192.168.1.100/channel/1/sub"),
+            "a typed template wins over the checkbox"
+        );
+
+        let unmatched = BulkCameraDraft {
+            main_template: "rtsp://192.168.1.100/channel/{n}".into(),
+            channels: "1".into(),
+            infer_sub: true,
+            ..Default::default()
+        };
+        assert!(
+            !unmatched.can_infer_sub(),
+            "no rule means there is nothing to offer"
+        );
+        assert!(unmatched.build().unwrap()[0].rtsp_sub.is_none());
+
+        let partial = BulkCameraDraft {
+            main_template: "rtsp://192.168.1.100/stream{n}".into(),
+            channels: "1-2".into(),
+            infer_sub: true,
+            ..Default::default()
+        };
+        assert!(
+            partial.can_infer_sub(),
+            "one channel with a rule is enough to offer the batch check"
+        );
+        let half = partial.build().unwrap();
+        assert_eq!(
+            half[0].rtsp_sub.as_deref(),
+            Some("rtsp://192.168.1.100/stream2"),
+            "the channel that has a rule gets its address"
+        );
+        assert!(
+            half[1].rtsp_sub.is_none(),
+            "the channel without a rule gets none, rather than an unseen one"
+        );
+
+        // The form's own Hikvision example over its usual channel range. The
+        // channel number can be several digits, so every camera gets a sub.
+        let hikvision = BulkCameraDraft {
+            main_template: main_template.clone(),
+            channels: "1-16".into(),
+            infer_sub: true,
+            ..Default::default()
+        };
+        assert!(hikvision.can_infer_sub(), "a common batch keeps the offer");
+        let sixteen = hikvision.build().unwrap();
+        assert_eq!(sixteen.len(), 16);
+        assert_eq!(sixteen[0].rtsp_sub.as_deref(), Some(derived));
+        assert_eq!(
+            sixteen[9].rtsp_sub.as_deref(),
+            Some("rtsp://192.168.1.100/Streaming/Channels/1002"),
+            "channel 10 still infers a sub"
+        );
+        assert_eq!(
+            sixteen[15].rtsp_sub.as_deref(),
+            Some("rtsp://192.168.1.100/Streaming/Channels/1602"),
+            "channel 16 still infers a sub"
+        );
+
+        let literal = BulkCameraDraft {
+            main_template: "rtsp://192.168.1.100/Streaming/Channels/101".into(),
+            channels: "1".into(),
+            infer_sub: true,
+            ..Default::default()
+        };
+        assert!(
+            !literal.can_infer_sub(),
+            "no channel token means the form cannot build a batch at all"
+        );
+    }
+
+    #[test]
+    fn a_camera_draft_saves_only_the_address_on_the_form() {
+        let source = CameraSource::new(
+            "cam",
+            "rtsp://192.168.1.100/Streaming/Channels/101",
+        );
+        let draft = CameraDraft::from_source(&source);
+        assert!(draft.infer_sub, "a camera without a sub starts in infer mode");
+        assert!(
+            draft.build().unwrap().rtsp_sub.is_none(),
+            "the builder saves no address the form has not shown"
+        );
+
+        let mut stale = draft.clone();
+        stale.main = "rtsp://192.168.1.100/other/1".into();
+        stale.sub = "rtsp://192.168.1.100/Streaming/Channels/102".into();
+        assert_eq!(
+            stale.build().unwrap().rtsp_sub.as_deref(),
+            Some("rtsp://192.168.1.100/Streaming/Channels/102"),
+            "when the main url no longer offers inference, the visible address is kept"
+        );
+
+        let mut edited = draft;
+        edited.sub = "rtsp://192.168.1.100/Streaming/Channels/102".into();
+        edited.infer_sub = false;
+        assert_eq!(
+            edited.build().unwrap().rtsp_sub.as_deref(),
+            Some("rtsp://192.168.1.100/Streaming/Channels/102"),
+            "unticking keeps the address for editing and saves it"
+        );
+
+        let mut with_sub = source;
+        with_sub.rtsp_sub = Some("rtsp://192.168.1.100/Streaming/Channels/102".into());
+        assert!(
+            !CameraDraft::from_source(&with_sub).infer_sub,
+            "an existing address is left editable"
+        );
+    }
+
+    #[test]
+    fn typing_over_a_hidden_infer_check_makes_the_sub_manual() {
+        let mut check = true;
+        keep_a_hand_typed_sub(false, true, &mut check);
+        assert!(!check, "a typed address is no longer the rule's to replace");
+
+        let mut untouched = true;
+        keep_a_hand_typed_sub(false, false, &mut untouched);
+        assert!(untouched, "the address still shown is still derived");
+
+        let mut manual = false;
+        keep_a_hand_typed_sub(true, true, &mut manual);
+        assert!(!manual, "an unticked check stays unticked when a rule applies");
+    }
+
+    #[test]
+    fn bulk_cameras_allow_reuse_across_groups() {
+        let draft = BulkCameraDraft {
+            main_template: "rtsp://192.168.1.100/channel/{n}".into(),
+            channels: "1-2".into(),
+            infer_sub: false,
+            ..Default::default()
+        };
+        let mut config = AppConfig::default();
+
+        for source in draft.build().unwrap() {
+            assert!(!bulk_camera_exists(&config, &source));
+            config.upsert_camera(source);
+        }
+        assert_eq!(config.cameras.len(), 2);
+
+        for source in draft.build().unwrap() {
+            assert!(bulk_camera_exists(&config, &source));
+        }
+
+        let second = config.add_group("Second wall".into());
+        config.active_group = second;
+
+        for source in draft.build().unwrap() {
+            assert!(!bulk_camera_exists(&config, &source));
+            config.upsert_camera(source);
+        }
+
+        assert_eq!(config.cameras.len(), 4);
+        assert_eq!(
+            config.cameras.iter()
+                .filter(|camera| usize::from(camera.group) == second)
+                .count(),
+            2
+        );
+
+        for source in draft.build().unwrap() {
+            assert!(bulk_camera_exists(&config, &source));
+        }
+    }
+    #[test]
+    fn bulk_cameras_expand_channel_templates() {
+        monitor_i18n::init("en", &[]);
+        let draft = BulkCameraDraft {
+            name_prefix: "Recorder A".into(),
+            main_template: "rtsp://192.168.1.100/Streaming/Channels/{n}01".into(),
+            sub_template: "rtsp://192.168.1.100/Streaming/Channels/{n}02".into(),
+            username: "admin".into(),
+            password: "secret".into(),
+            channels: "1-16".into(),
+            ..Default::default()
+        };
+
+        let cameras = draft.build().unwrap();
+        assert_eq!(cameras.len(), 16);
+        assert_eq!(cameras[0].name, "Recorder A — Camera 01");
+        assert_eq!(cameras[0].rtsp_main, "rtsp://192.168.1.100/Streaming/Channels/101");
+        assert_eq!(cameras[0].rtsp_sub.as_deref(), Some("rtsp://192.168.1.100/Streaming/Channels/102"));
+        assert_eq!(cameras[15].rtsp_main, "rtsp://192.168.1.100/Streaming/Channels/1601");
+        assert_eq!(cameras[15].rtsp_sub.as_deref(), Some("rtsp://192.168.1.100/Streaming/Channels/1602"));
+        assert_eq!(cameras[0].username.as_deref(), Some("admin"));
+        assert_eq!(cameras[0].password.as_deref(), Some("secret"));
+    }
+
+    #[test]
+    fn bulk_cameras_expand_channel_lists() {
+        monitor_i18n::init("en", &[]);
+        let draft = BulkCameraDraft {
+            main_template: "rtsp://192.168.1.100/channel/{n}".into(),
+            channels: "3,5-6,9".into(),
+            infer_sub: false,
+            ..Default::default()
+        };
+
+        let cameras = draft.build().unwrap();
+        assert_eq!(cameras.len(), 4);
+        assert_eq!(cameras[0].name, "Camera 03");
+        assert_eq!(cameras[1].rtsp_main, "rtsp://192.168.1.100/channel/5");
+        assert_eq!(cameras[2].rtsp_main, "rtsp://192.168.1.100/channel/6");
+        assert_eq!(cameras[3].rtsp_main, "rtsp://192.168.1.100/channel/9");
+        assert!(cameras.iter().all(|camera| camera.rtsp_sub.is_none()));
+    }
+
+    #[test]
+    fn bulk_cameras_reject_invalid_parameters() {
+        let valid = BulkCameraDraft {
+            main_template: "rtsp://192.168.1.100/channel/{n}".into(),
+            infer_sub: false,
+            ..Default::default()
+        };
+
+        for channels in ["", "x", "5-3", "1-", "1,,2", "65536", "1-65536"] {
+            assert!(
+                BulkCameraDraft { channels: channels.into(), ..valid.clone() }
+                    .build()
+                    .is_err(),
+                "channels: {channels}"
+            );
+        }
+        let too_many = format!("1-{}", 257);
+        assert!(BulkCameraDraft {
+            channels: too_many,
+            ..valid.clone()
+        }.build().is_err());
+        let duplicated = BulkCameraDraft {
+            channels: "1,1,2".into(),
+            ..valid.clone()
+        };
+        assert_eq!(duplicated.build().unwrap().len(), 2, "duplicates are dropped");
+        assert!(BulkCameraDraft {
+            main_template: "rtsp://192.168.1.100/channel/1".into(),
+            ..valid.clone()
+        }.build().is_err());
+        assert!(BulkCameraDraft {
+            sub_template: "rtsp://192.168.1.100/sub/1".into(),
+            ..valid
+        }.build().is_err());
+    }
 
     /// A configuration from 1.x has no `frigate` on a camera a Frigate import
     /// brought in. Every field `add_offer` used to compare is unchanged, so a

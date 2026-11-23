@@ -243,7 +243,15 @@ fn format_message(
     for error in &errors {
         tracing::warn!(target: "xgview::i18n", key, %error, "translation formatting error");
     }
-    Some(text.into_owned())
+    // Fluent wraps a placeable that lives inside a referenced message in
+    // isolate marks (U+2068/U+2069). They only matter for bidirectional
+    // scripts; egui lays text out left to right and would draw them as
+    // invisible noise, so drop them after formatting.
+    let text: String = text
+        .chars()
+        .filter(|c| *c != '\u{2068}' && *c != '\u{2069}')
+        .collect();
+    Some(text)
 }
 
 /// The English bundle: the embedded pack, then any external English pack that
@@ -418,6 +426,24 @@ mod tests {
     }
 
     #[test]
+    fn the_picked_hints_reuse_their_common_parts() {
+        init(DEFAULT_LANGUAGE, &[]);
+        let hint = tr("layout-editor-merge-hint");
+        assert!(
+            hint.starts_with("Merge cells:") && hint.contains("drag"),
+            "the hint leads with the operation and names the drag gesture"
+        );
+        assert_eq!(
+            tr_args("layout-editor-merge-picked", &[("cell", 3usize.into())]),
+            "Selected cell 3. Choose a matching neighbour, or drag to another cell to merge every cell inside the rectangle. Press it again to deselect."
+        );
+        assert_eq!(
+            tr_args("layout-editor-merge-picked-splittable", &[("cell", 3usize.into())]),
+            "Selected cell 3. Choose a neighbour, drag to another cell to merge every cell inside the rectangle, or use Split cell to break it apart. Press it again to deselect."
+        );
+    }
+
+    #[test]
     fn an_unknown_language_falls_back_to_english() {
         init("xx-XX", &[]);
         assert_eq!(current_language(), DEFAULT_LANGUAGE);
@@ -438,6 +464,27 @@ mod tests {
         );
     }
 
+    #[test]
+    fn bulk_camera_translations_work_in_all_languages() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let dirs = [root.join("langs")];
+
+        for (language, expected_name, expected_hint) in [
+            ("en", "Camera 01", "RTSP template"),
+            ("zh-CN", "摄像头 01", "RTSP 模板"),
+        ] {
+            init(language, &dirs);
+            assert_eq!(
+                tr_args("dialog-bulk-camera-name", &[("number", "01".into())]),
+                expected_name,
+                "language: {language}"
+            );
+            let hint = tr("dialog-bulk-hint");
+            assert!(hint.contains(expected_hint), "language: {language}, hint: {hint}");
+            assert!(hint.contains("{n}"), "language: {language}, hint: {hint}");
+            assert_ne!(tr("dialog-bulk-error-channels"), "dialog-bulk-error-channels");
+        }
+    }
     #[test]
     fn zh_cn_pack_parses_and_has_keys() {
         let manifest_dir = env!("CARGO_MANIFEST_DIR");

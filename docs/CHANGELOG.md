@@ -3,6 +3,102 @@
 What each release changed, newest first. Releases before 1.2.98 are in the git
 history.
 
+## 2.3.38
+
+Changes since 2.3.25.
+
+- **Sub-stream inference from the main address.** Ticking the derive box now
+  fills in the guessed sub address immediately and greys it out; unticking keeps
+  what was filled in and makes it editable again. The bulk importer applies the
+  same rule per channel, and shows the box whenever at least one channel's main
+  address can be derived. A hand-typed sub address is never overwritten when a
+  main address changes and changes back.
+- **More cameras infer a sub stream.** Hikvision-style `/Channels/101` now
+  derives for multi-digit channels too (1001, 1601), and rules were added for
+  Reolink, EZVIZ, Xiongmai, Uniview, Bosch and Vivotek. Reolink cameras whose
+  main stream is H.265 get an H.264 sub address, since that is all they serve.
+- **Picture fit follows the wall's orientation.** The tile menu's next-fit
+  label and the change it makes now act on the portrait aspect when the wall is
+  upright, leaving the landscape setting alone.
+- **Dialogs fit an upright screen.** Camera forms are clamped to the screen
+  width, address fields fill their column, and the edit dialog is a little
+  narrower. Landscape screens keep their previous width.
+- **Greyed-out controls stay out of the keyboard walk.** Disabled buttons no
+  longer take focus via the arrow keys; the walk hands focus to the next live
+  control instead.
+- **Fixed:** the magnified OSD on Android now reports the main stream's real
+  resolution instead of `?x?` or the sub stream's leftover size, for cameras
+  whose RTSP description carries no picture size.
+
+## 2.3.25
+
+Changes since 2.2.106.
+
+- **Custom layouts.** Beyond the built-in grids, four user-defined layouts can
+  be saved and switched from the toolbar. Each is a rectangular grid up to 7x7
+  whose cells can be merged into larger ones and split again — by button or by
+  dragging across them on a touch screen — and the editor previews the result
+  before it is saved. 5x5 and 6x6 are simply sizes you can set, not fixed
+  presets.
+- **Clean View.** Settings → Display can hide the toolbar, status bar and the
+  routine tile overlays after a while idle, in full screen or in a window, with
+  the delay you choose. A click or a key brings them back; connection errors and
+  the recording indicator are never hidden.
+- **A recording indicator on live tiles.** For Frigate cameras a small square
+  beside the live dot turns red while the camera is being recorded and grey when
+  it is not, so a missed recording is visible on the wall at a glance.
+- **Right-click a tile** on a desktop for Edit, Delete, Picture fit, Stream and
+  Connection — the menu shows the state each switch will move to.
+- **Bulk camera import.** The Manual page can add every camera from one
+  recorder at once, using a name prefix, main/sub address templates and a
+  channel list such as `1-4,7,9-11`. Cameras already present are reused across
+  groups.
+- **An easier-to-read camera list.** Alternating row shades, names and RTSP
+  addresses that truncate with a tooltip instead of spilling over, and the
+  edit and delete controls on separate lines.
+- **Incoming bitrate** — current and 60-second average — is shown in About.
+- **Russian interface**, selected from the same Language picker as the other
+  packs. A pack that translates only part of the interface still falls back to
+  English for the rest.
+- **Connection failures are named in every language.** A tile now says *rejected
+  credentials*, *timed out*, *unreachable* and so on instead of an English error
+  string, whether it is retrying, reconnecting or has given up.
+- **Fixed:** low-frame-rate streams that arrived in bursts no longer hold one
+  picture and then jump, and an 8x replay no longer loses two thirds of its
+  speed to a decoder output wait; dragging across cells to merge them now works with a
+  finger as well as a mouse; and a right-click menu no longer flickers when the
+  same tile is clicked a second time.
+
+## 2.2.106
+
+Changes since 2.2.98.
+
+- **Live pictures keep the rhythm of the wire.** A low-frame-rate camera that
+  sent its pictures in bursts - a twelve-frame doorbell delivering eight at
+  once - no longer holds one frame and then jumps. Each live picture is placed
+  on the clock its timestamp names, and that clock learns the stream's frame
+  interval so a wandering timestamp or a bursty wire cannot make it run at a
+  speed of its own. A lead that widens while frames arrive late and narrows
+  only after a calm absorbs the jitter.
+- **Android hands frames over by feed rate, not by the gap between pictures.**
+  A batch leaving a slow decoder no longer loses all but its first frame.
+  The doorbell's decoder is asked for low latency, with a fallback for decoders
+  that refuse the request and a reorder check for streams carrying B frames; a
+  failed start is no longer mistaken for a refusal that disables the option
+  for the whole process.
+- **A crowded picture queue is now cut at a key frame.** Dropping its oldest
+  non-key frame orphaned everything predicted from it; what remains keeps a
+  whole reference chain. Switching channels also clears the sound waiting in
+  the audio queue.
+- **Sound is back to the lowest delay the device allows.** A shorter playback
+  track was measured and then removed, as were four other attempts to move the
+  picture's delay into the audio path. Decoded sound is written as it arrives
+  again with a half-second device buffer. The remaining picture-to-sound gap
+  was measured on three devices and in Frigate's own player and comes from the
+  recording and the Android audio chain, not from this viewer.
+- **Fixed:** the low-latency refusal check now looks only at configure time,
+  and a no-op in the reorder test was removed.
+
 ## 2.2.98
 
 Changes since 2.2.84.

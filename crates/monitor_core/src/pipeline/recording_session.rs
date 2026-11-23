@@ -143,6 +143,11 @@ pub(super) async fn run_recording_session(
     let mut decoder: Option<Box<dyn VideoDecoder>> = None;
     let mut audio_decoder: Option<(Box<dyn AudioDecoder>, AudioStreamInfo)> = None;
     let mut codec: Option<Codec> = None;
+    // The baseline flag and nothing else: a recording hands its decoder the
+    // parameter sets once, at the init segment, and every sample after is a
+    // picture without them. A decoder reopened here would have nothing to
+    // configure from, so a rewrite that turned out to be wrong could not be
+    // taken back. See [`BaselineFix::new`].
     let mut baseline_fix = BaselineFix::new();
     let mut codec_label: Option<String> = None;
     let mut width: Option<u32> = None;
@@ -513,7 +518,7 @@ pub(super) async fn run_recording_session(
                         window.counters.frames += 1;
                         total_frames += 1;
                     }
-                    announce_streaming(events, index, camera_id_str, stream, &mut announced);
+                    announce_streaming(events, index, camera_id_str, &mut announced);
 
                     if let Some(codec) = codec {
                         baseline_fix.observe(index, codec, &mut sample.data);
@@ -629,7 +634,8 @@ pub(super) async fn run_recording_session(
             pace_decode = Duration::ZERO;
             pace_samples = 0;
             pace_late = 0;
-            window.close();
+            let counted = window.close();
+            stats.add_bytes(counted.bytes);
         }
     }
 

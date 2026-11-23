@@ -4,7 +4,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{CoreError, Result};
-use crate::layout::GridLayout;
+use crate::layout::{CustomGrid, GridLayout};
 use crate::model::{new_id, CameraSource, ConnectionMode, CombinedInfo, Osd, OsdItem};
 use crate::{APP_NAME, CONFIG_FILE_NAME};
 
@@ -564,6 +564,11 @@ pub struct Group {
     /// [`AppConfig::adopt_portrait_view`].
     pub portrait_page: usize,
     pub portrait_focus: Option<usize>,
+    /// The viewer's four custom grids, in the order the picker shows them.
+    /// `None` is an empty slot, drawn as "+" and ready to be edited. Kept per
+    /// group so two groups can keep different walls without colliding.
+    #[serde(default)]
+    pub custom_layouts: [Option<CustomGrid>; 4],
 }
 
 impl Group {
@@ -602,12 +607,19 @@ impl Default for Group {
             focus: None,
             portrait_page: 0,
             portrait_focus: None,
+            custom_layouts: [None, None, None, None],
         }
     }
 }
 
 fn default_chrome_idle_secs() -> f32 {
     3.5
+}
+
+/// Full screen is the mode the old auto-hide already worked in, so it stays on
+/// when an older configuration is read.
+fn default_clean_view_fullscreen() -> bool {
+    true
 }
 
 fn default_combined_info() -> CombinedInfo {
@@ -745,13 +757,21 @@ pub struct AppConfig {
     #[serde(default = "default_combined_info")]
     pub combined_info: CombinedInfo,
     /// How long the interface shell — toolbar, status bar — stays visible after
-    /// the last input while full screen, in seconds.  Zero means it never hides.
+    /// the last input, in seconds. Zero means it never hides. Which modes this
+    /// applies to is decided by the `clean_view_*` switches below.
     #[serde(default = "default_chrome_idle_secs")]
     pub chrome_idle_secs: f32,
-    /// Hide the wall's controls and routine live OSD after five idle seconds,
-    /// in both windowed and fullscreen modes. Transient visibility is UI state.
+    /// Whether the idle hide above runs while full screen. On by default so an
+    /// upgrade changes nothing: this used to be the only mode that hid.
+    #[serde(default = "default_clean_view_fullscreen")]
+    pub clean_view_fullscreen: bool,
+    /// Whether the idle hide runs while windowed as well. Off by default.
     #[serde(default)]
-    pub clean_view: bool,
+    pub clean_view_windowed: bool,
+    /// Whether the idle hide also takes the four corner OSD blocks with it.
+    /// The centre status panel is feedback, not OSD, and is never hidden.
+    #[serde(default)]
+    pub clean_view_osd: bool,
     pub cameras: Vec<CameraSource>,
 }
 
@@ -788,7 +808,9 @@ impl Default for AppConfig {
             osd: Osd::default(),
             combined_info: default_combined_info(),
             chrome_idle_secs: default_chrome_idle_secs(),
-            clean_view: false,
+            clean_view_fullscreen: default_clean_view_fullscreen(),
+            clean_view_windowed: false,
+            clean_view_osd: false,
             cameras: Vec::new(),
         }
     }
@@ -1345,6 +1367,23 @@ impl AppConfig {
                 .iter()
                 .filter(|camera| usize::from(camera.group) == index && camera.enabled)
                 .count();
+            // A custom grid can arrive from a hand-edited file with bad
+            // dimensions or a hole in it. Drop any such slot, and if the wall
+            // is currently showing one, send it back to the default grid
+            // before its capacity is used to clamp the page below. The
+            // portrait grid is never custom, so only the landscape side needs
+            // this.
+            let group = &mut self.groups[index];
+            for slot in &mut group.custom_layouts {
+                if slot.as_ref().is_some_and(|grid| !grid.is_valid()) {
+                    *slot = None;
+                }
+            }
+            if let GridLayout::Custom(grid) = group.layout {
+                if !grid.is_valid() {
+                    group.layout = GridLayout::default();
+                }
+            }
             let Group {
                 layout,
                 portrait_layout,
@@ -1576,22 +1615,72 @@ fn keep_previous(path: &Path) -> std::io::Result<()> {
 mod tests {
     use super::*;
 
+    /// A configuration written before custom grids existed has no slots; it
+    /// must come back with four empty ones and keep the preset it had.
     #[test]
-    fn clean_view_defaults_off_and_survives_save_and_reload() {
-        assert!(!AppConfig::default().clean_view);
+    fn custom_layout_slots_default_empty_for_old_configurations() {
+        let legacy = AppConfig::from_json(r#"{"version":1,"groups":[{"layout":"3x3"}],"cameras":[]}"#).unwrap();
+        assert_eq!(legacy.groups[0].custom_layouts, [None, None, None, None]);
+        assert_eq!(legacy.groups[0].layout, GridLayout::G3x3);
+    }
+
+    #[test]
+    fn custom_layout_slots_survive_a_save_and_load() {
+        let grid = CustomGrid::uniform(3, 2);
+        let mut config = AppConfig::default();
+        config.group_mut().custom_layouts[1] = Some(grid);
+        let path = std::env::temp_dir().join(format!("xgview-custom-layouts-{}.json", crate::model::new_id()));
+        config.save(&path).unwrap();
+        let restored = AppConfig::load(&path).unwrap();
+        assert_eq!(restored.groups[0].custom_layouts[1], Some(grid));
+        assert!(restored.groups[0].custom_layouts[0].is_none());
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(previous_path(&path));
+    }
+
+    #[test]
+    fn a_broken_custom_grid_is_dropped_on_load() {
+        // A count larger than the grid can hold is not a valid layout. Built
+        // in code here because a bad hand-edited file would fail to parse
+        // before normalize ever sees it.
+        let mut bad = CustomGrid::uniform(3, 2);
+        bad.count = 40;
+        let mut config = AppConfig::default();
+        config.group_mut().layout = GridLayout::Custom(bad);
+        config.group_mut().custom_layouts[0] = Some(bad);
+        config.normalize();
+        assert_eq!(config.groups[0].layout, GridLayout::G2x2);
+        assert!(config.groups[0].custom_layouts[0].is_none());
+    }
+
+    /// Clean View is three switches, not the pull request's single one. A
+    /// configuration written before they existed must behave exactly as it did
+    /// on the old build: only full screen hides the bars, and no corner label
+    /// is touched.
+    #[test]
+    fn clean_view_defaults_keep_the_old_fullscreen_only_behaviour() {
+        let fresh = AppConfig::default();
+        assert!(fresh.clean_view_fullscreen);
+        assert!(!fresh.clean_view_windowed);
+        assert!(!fresh.clean_view_osd);
+
         let legacy = AppConfig::from_json(r#"{"version":1,"groups":[{}]}"#).unwrap();
-        assert!(!legacy.clean_view);
+        assert!(legacy.clean_view_fullscreen);
+        assert!(!legacy.clean_view_windowed);
+        assert!(!legacy.clean_view_osd);
+
         let path = std::env::temp_dir().join(format!("xgview-clean-view-{}.json", crate::model::new_id()));
         let mut config = AppConfig::default();
-        config.clean_view = true;
+        config.clean_view_fullscreen = false;
+        config.clean_view_windowed = true;
+        config.clean_view_osd = true;
         config.group_mut().layout = GridLayout::G3x3;
         config.save(&path).unwrap();
-        let mut restored = AppConfig::load(&path).unwrap();
-        assert!(restored.clean_view);
+        let restored = AppConfig::load(&path).unwrap();
+        assert!(!restored.clean_view_fullscreen);
+        assert!(restored.clean_view_windowed);
+        assert!(restored.clean_view_osd);
         assert_eq!(restored.group().layout, config.group().layout);
-        restored.clean_view = false;
-        restored.save(&path).unwrap();
-        assert!(!AppConfig::load(&path).unwrap().clean_view);
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(previous_path(&path));
     }
@@ -2066,28 +2155,6 @@ mod tests {
         assert_eq!(config.active_group, 0);
         assert_eq!(config.groups.len(), 1, "the built-in group stands");
         assert_eq!(config.groups[0].layout, GridLayout::G3x3);
-    }
-
-    #[test]
-    fn custom_layout_round_trips_per_group() {
-        let mut config = AppConfig::default();
-        let group = config.add_group(String::from("Office"));
-        let custom = GridLayout::Custom { columns: 3, rows: 2 };
-        config.groups[group].layout = custom;
-
-        let restored = AppConfig::from_json(&serde_json::to_string(&config).unwrap()).unwrap();
-        assert_eq!(restored.groups[0].layout, GridLayout::default());
-        assert_eq!(restored.groups[group].layout, custom);
-        assert_eq!(custom.capacity(), 6);
-        use crate::layout::{navigate, Direction, NavigateOutcome};
-        assert_eq!(
-            navigate(custom, 0, Some(1), Direction::Down, 6),
-            NavigateOutcome::Moved { focus: 4 },
-        );
-        assert_eq!(
-            custom.cells().iter().map(|cell| (cell.col, cell.row)).collect::<Vec<_>>(),
-            vec![(0, 0), (1, 0), (2, 0), (0, 1), (1, 1), (2, 1)],
-        );
     }
 
     /// A group's order is its own: reordering one leaves the other groups' work

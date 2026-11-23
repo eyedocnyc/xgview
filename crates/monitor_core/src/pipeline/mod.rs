@@ -27,7 +27,7 @@ use monitor_codec::{Codec, ColorSpace, DecodedFrame, DecoderConfig, VideoDecoder
 use crate::audio::{AacRtpParams, AudioHub};
 use crate::config::ReconnectPolicy;
 use crate::discovery::frigate::VodPlaylist;
-use crate::error::{FailureKind, Result};
+use crate::error::{CoreError, FailureKind, Result};
 use crate::h264::{nal_unit_type, AccessUnit, H264Depacketizer, START_CODE};
 use crate::hevc::{nal_unit_type as hevc_nal_unit_type, HevcDepacketizer};
 use crate::mjpeg::{JpegDepacketizer, MjpegClient};
@@ -125,6 +125,53 @@ pub enum CallFailure {
     Unreachable,
 }
 
+/// A failure and the original text it came from.
+///
+/// `kind` is the stable classification the backoff already reads; it is absent
+/// when no `CoreError` lay behind the end of the attempt — the initial
+/// placeholder and a peer that simply closed the stream. `text` is the exact
+/// error message, kept for logs and for a future detail view: it is the only
+/// place a concrete reason (a 401, a port, a hostname) survives.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Failure {
+    pub kind: Option<FailureKind>,
+    pub text: String,
+}
+
+impl Failure {
+    /// The reason with no classification behind it: nothing has failed with a
+    /// typed error yet, or the peer closed without saying why.
+    pub fn unclassified(text: impl Into<String>) -> Self {
+        Self { kind: None, text: text.into() }
+    }
+
+    pub fn of(error: &CoreError) -> Self {
+        Self { kind: Some(error.kind()), text: error.to_string() }
+    }
+}
+
+/// Why a connection state was reported, in a form the interface can name in
+/// any language.
+///
+/// A rendered line is one variant with all of its parameters. Variants that
+/// carry a failure keep it inside the variant rather than in a wrapper, so
+/// combinations that never occur cannot be built. A retry always follows an
+/// attempt that ended, so its failure is always present — its `kind` may be
+/// absent when no typed error lay behind the end of that attempt.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Diagnostic {
+    /// A session failed for a reason waiting will not change.
+    Failed { failure: Failure },
+    /// The main stream could not be reached; the MSE fallback is being tried.
+    RtspFallback { attempt: usize },
+    /// A reconnect is scheduled, with whatever reason the last attempt gave.
+    Reconnecting { failure: Failure, milliseconds: i64 },
+    /// Retries ran out, with whatever reason the last attempt gave.
+    GaveUp { failure: Failure, attempts: usize },
+    /// A recording had nothing at the requested moment.
+    NothingThere,
+}
+
 /// Everything a channel reports to the renderer.
 ///
 /// Each of these marks a change and has to be seen, so they travel on a channel
@@ -138,7 +185,9 @@ pub enum StreamEvent {
         index: usize,
         camera_id: String,
         state: ConnectionState,
-        detail: String,
+        /// Why this state was reported. `None` where there is nothing to say:
+        /// a clean finish, or an attempt still waiting on a handshake.
+        detail: Option<Diagnostic>,
     },
     /// Whether the camera behind a channel can be talked to.
     ///
@@ -224,9 +273,21 @@ pub struct VideoFrame {
 /// repaint that falls behind therefore skips the pictures it did not see
 /// instead of queueing them, which is what keeps a 4x4 grid of 25 fps streams
 /// from building an unbounded backlog of megabytes.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct FrameStore {
     channels: Mutex<HashMap<usize, ChannelFrames>>,
+    /// Called once a picture has been published, on the thread that published
+    /// it.
+    ///
+    /// Without it the wall can only find a new picture by looking again on a
+    /// timer, and a timer cannot be the right rate for every camera: forty
+    /// milliseconds is what the wall used to ask for, and a twelve-frame stream
+    /// is eighty-three milliseconds a frame, so each picture was shown for two
+    /// of those waits or for three by turns. The viewer reads that rhythm as
+    /// stutter even though every counter says the pacing was perfect. Waking
+    /// the painter when the picture lands makes the screen follow the stream
+    /// instead of the timer.
+    wake: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 /// What the store holds for one channel.
@@ -250,8 +311,47 @@ struct ChannelFrames {
     moment: Option<f64>,
 }
 
+impl std::fmt::Debug for FrameStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The wake callback is a closure from the renderer and has no useful
+        // shape to print; what matters is whether one is installed.
+        let listening = self.wake.lock().map(|slot| slot.is_some()).unwrap_or(false);
+        f.debug_struct("FrameStore")
+            .field("channels", &self.channels)
+            .field("wake", &listening)
+            .finish()
+    }
+}
+
 impl FrameStore {
+    /// Names what to call when a picture lands, so that the wall paints on the
+    /// stream's clock rather than on a timer's. See [`FrameStore::wake`].
+    pub fn set_wake(&self, wake: Arc<dyn Fn() + Send + Sync>) {
+        if let Ok(mut slot) = self.wake.lock() {
+            *slot = Some(wake);
+        }
+    }
+
+    /// Stops waking the painter, for a view that would rather be driven by its
+    /// own timer - a wall of many pictures, where the waking costs more than the
+    /// pictures it lands on are worth. See `XgViewApp::paint_on_the_stream`.
+    pub fn clear_wake(&self) {
+        if let Ok(mut slot) = self.wake.lock() {
+            *slot = None;
+        }
+    }
+
+    /// Wakes the painter, outside the channel lock: the callback belongs to the
+    /// renderer and may take locks of its own.
+    fn wake_painter(&self) {
+        let wake = self.wake.lock().ok().and_then(|slot| slot.clone());
+        if let Some(wake) = wake {
+            wake();
+        }
+    }
+
     fn publish(&self, index: usize, frame: Arc<VideoFrame>) {
+        let mut landed = false;
         if let Ok(mut channels) = self.channels.lock() {
             let entry = channels.entry(index).or_default();
             // Two sessions publishing into one channel is a picture that
@@ -275,6 +375,10 @@ impl FrameStore {
             }
             entry.newest = Some(frame);
             entry.published += 1;
+            landed = true;
+        }
+        if landed {
+            self.wake_painter();
         }
     }
 
@@ -309,12 +413,29 @@ impl FrameStore {
     }
 
     /// Pictures a channel has published since the process started.
-    fn published(&self, index: usize) -> u64 {
+    ///
+    /// Public so a session can report it beside the pictures it decoded: the
+    /// gap between the two is where a picture was decoded and then never
+    /// reached the renderer, which is a fault on this side of the wire and
+    /// looks like a frozen tile rather than like a slow one.
+    pub fn published(&self, index: usize) -> u64 {
         self.channels
             .lock()
             .ok()
             .and_then(|channels| channels.get(&index).map(|entry| entry.published))
             .unwrap_or(0)
+    }
+
+    /// The sequence of the picture a repaint would take, if there is one.
+    ///
+    /// A session reports it beside its own counters so that a tile which is
+    /// decoded for nobody can be told from one whose pictures are simply not
+    /// being drawn: this number not moving while the session decodes is the
+    /// store never being written.
+    pub fn newest_sequence(&self, index: usize) -> Option<u64> {
+        let channels = self.channels.lock().ok()?;
+        let entry = channels.get(&index)?;
+        entry.newest.as_ref().map(|frame| frame.sequence)
     }
 }
 
@@ -378,6 +499,13 @@ struct StatsInner {
     /// Which session owns a channel's numbers, as [`FrameStore`] does for its
     /// Samples published since the process started.
     published: u64,
+    /// Every byte any session has taken off the wire since this store was
+    /// made. Unlike the per-channel samples this only ever climbs: a viewer
+    /// reads two instants of it and divides the difference by the time between
+    /// them to learn the bitrate actually received over that whole interval.
+    /// Counting bytes rather than averaging published rates keeps the sum
+    /// honest when channels come and go, and needs no sampling of its own.
+    total_bytes: u64,
 }
 
 impl StatsStore {
@@ -387,6 +515,19 @@ impl StatsStore {
             let sequence = inner.published;
             inner.channels.insert(stats.index, Arc::new(StatsEntry { sequence, stats }));
         }
+    }
+
+    /// Adds the bytes a closing statistics window delivered. Called once by
+    /// each session as its window closes, so a byte is counted at most once.
+    pub(crate) fn add_bytes(&self, bytes: u64) {
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.total_bytes = inner.total_bytes.saturating_add(bytes);
+        }
+    }
+
+    /// The running total of bytes received across every session.
+    pub fn total_bytes(&self) -> u64 {
+        self.inner.lock().map_or(0, |inner| inner.total_bytes)
     }
 
     /// Newest sample of a channel, `None` until it has published one.
@@ -1187,6 +1328,29 @@ mod tests {
     use super::supervisor::TalkEntry;
     use super::ws_session::is_frigate_mse;
     use super::*;
+
+    #[test]
+    fn a_failure_keeps_its_kind_and_its_original_text() {
+        let error = CoreError::auth("401 Unauthorized");
+        let failure = Failure::of(&error);
+        assert_eq!(failure.kind, Some(FailureKind::Auth));
+        assert_eq!(failure.text, error.to_string());
+
+        // A peer that closes without a typed error still has a reason to name,
+        // but no classification for the backoff or the tile phrase.
+        let closed = Failure::unclassified("stream closed by peer");
+        assert_eq!(closed.kind, None);
+        assert_eq!(closed.text, "stream closed by peer");
+    }
+
+    #[test]
+    fn a_recordings_hole_is_a_diagnostic_not_a_failure_kind() {
+        // The renderer reads this variant to decide a seek landed in a hole;
+        // a clean finish carries none. The two must stay distinct.
+        let hole = Some(Diagnostic::NothingThere);
+        assert!(matches!(hole, Some(Diagnostic::NothingThere)));
+        assert!(!matches!(None::<Diagnostic>, Some(Diagnostic::NothingThere)));
+    }
     use crate::model::{CameraOrigin, TileAspect};
 
     /// A control keeps what it is told before anybody is listening.
@@ -1357,6 +1521,71 @@ mod tests {
         let mut hevc = vec![0x00, 0x00, 0x01, 0x42, 0x01, 0x02];
         assert!(!BaselineFix::new().observe(0, Codec::H265, &mut hevc));
         assert_eq!(hevc[3], 0x42, "an H.265 unit is untouched");
+    }
+
+    /// A session that cannot reopen its decoder mid-stream leaves the set
+    /// alone beyond the baseline flag.
+    ///
+    /// The level and the reorder declaration both change what a decoder is
+    /// configured with, and a decoder keeps that for as long as it lives. A
+    /// recording and the MSE path hand over their parameter sets once and
+    /// never again, so a decoder reopened there would have nothing to configure
+    /// from - a wrong answer could not be taken back, and the safe direction is
+    /// not to give one. The set below is the doorbell's: High profile, level
+    /// 5.1, 640x480, no VUI - all three things a live session acts on.
+    #[test]
+    fn a_session_that_cannot_reopen_its_decoder_rewrites_only_the_baseline() {
+        const SPS: [u8; 11] =
+            [0x67, 0x64, 0x00, 0x33, 0xac, 0x15, 0x14, 0xa0, 0xa0, 0x3d, 0x90];
+        let unit = || {
+            let mut unit = vec![0x00, 0x00, 0x01];
+            unit.extend_from_slice(&SPS);
+            unit
+        };
+
+        let mut plain = unit();
+        assert!(
+            !BaselineFix::new().observe(0, Codec::H264, &mut plain),
+            "a session that cannot reopen its decoder rewrote the set"
+        );
+        assert_eq!(plain, unit(), "and it is the set the camera sent");
+
+        let mut live = unit();
+        assert!(BaselineFix::new_live().observe(0, Codec::H264, &mut live));
+        assert_eq!(live[6], 30, "a live session brings the level down");
+        assert!(live.len() > unit().len(), "and adds the declaration it was missing");
+    }
+
+    /// A retraction is answered once, and only where there was a declaration to
+    /// take back - the caller uses the answer to reopen a decoder that was
+    /// configured from the rewritten set.
+    #[test]
+    fn a_retraction_is_reported_once() {
+        const SPS: [u8; 11] =
+            [0x67, 0x64, 0x00, 0x33, 0xac, 0x15, 0x14, 0xa0, 0xa0, 0x3d, 0x90];
+        let unit = || {
+            let mut unit = vec![0x00, 0x00, 0x01];
+            unit.extend_from_slice(&SPS);
+            unit
+        };
+
+        assert!(
+            !BaselineFix::new().retract(0),
+            "a session that never declared anything answered that it had"
+        );
+
+        let mut live = BaselineFix::new_live();
+        live.observe(0, Codec::H264, &mut unit());
+        assert!(live.retract(0), "the declaration is taken back");
+        assert!(!live.retract(0), "and only once");
+
+        // After it, the set is handed on as the camera sends it - the level is
+        // still brought down, because what a stream reorders has nothing to do
+        // with what its pictures need.
+        let mut after = unit();
+        live.observe(0, Codec::H264, &mut after);
+        assert_eq!(after.len(), unit().len(), "a VUI was added after the retraction");
+        assert_eq!(after[6], 30, "the level is still brought down");
     }
 
     #[test]
@@ -1581,6 +1810,23 @@ mod tests {
         assert_eq!(second.stats.fps, 25.0, "the older sample is gone, not queued");
         assert!(second.sequence > first.sequence, "and is told from the one before it");
         assert!(store.latest(4).is_none(), "one channel's sample is not another's");
+    }
+
+    /// Every session reports the bytes its closed window carried, and the
+    /// total only ever grows: a viewer takes two readings and divides by the
+    /// time between them. Clearing one channel's sample must not erase what
+    /// that channel already delivered.
+    #[test]
+    fn the_byte_total_survives_samples_and_session_changes() {
+        let store = StatsStore::default();
+        assert_eq!(store.total_bytes(), 0);
+
+        store.add_bytes(1_000);
+        store.add_bytes(2_000);
+        assert_eq!(store.total_bytes(), 3_000, "windows add up across sessions");
+
+        store.add_bytes(u64::MAX);
+        assert_eq!(store.total_bytes(), u64::MAX, "a runaway count saturates rather than wraps");
     }
 
     /// The numbers of a session that has ended describe nothing: the next one

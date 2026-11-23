@@ -4,7 +4,7 @@
 //! event queues (oneshot per frame), recomputes the decoding schedule and paints
 //! the grid. Everything else happens on the tokio runtime.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::path::Path;
@@ -20,12 +20,12 @@ use monitor_core::reboot;
 use monitor_core::config::{AppConfig, Orientation};
 use monitor_core::layout::{GridLayout, NavigateOutcome};
 use monitor_core::model::{infer_sub_stream, ConnectionState, OsdItem, StreamKind, TileAspect};
-use monitor_core::pipeline::{CallFailure, ChannelManager, StreamEvent, StreamStats};
+use monitor_core::pipeline::{CallFailure, ChannelManager, Diagnostic, StreamEvent, StreamStats};
 use monitor_core::scheduler::Scheduler;
 use monitor_core::talk::{TalkRoute, ToneFailure};
 use monitor_core::{CameraSource, Direction};
 
-use crate::dialogs::{self, BackgroundEvent, CameraDraft, DiscoveryUi, Tab};
+use crate::dialogs::{self, BackgroundEvent, CameraDraft, DiscoveryUi, Tab, modal_width};
 use self::file_picker::FilePicker;
 use crate::fonts;
 use crate::grid::{self, PictureZoom, Tile, TileActions};
@@ -56,6 +56,30 @@ const LINK_TAKEOVER: Duration = Duration::from_secs(5);
 /// `priv/docs/grid-cpu-cost.md` counts - a sixth of the whole frame's
 /// tessellation and composition, for a number.
 const LIVE_REPAINT: Duration = Duration::from_millis(40);
+
+/// How often the wall asks Frigate whether each camera is recording.
+///
+/// A recording segment is written about every ten seconds and is only visible
+/// once written, so the square beside the live dot is a short-lag answer.
+/// Thirty seconds keeps a dozen cameras at well under one request a second
+/// between them and buys an answer that is never more than a segment old.
+const RECORDING_POLL: Duration = Duration::from_secs(30);
+
+/// The most pictures a view may show and still be painted on the stream's
+/// clock rather than on [`LIVE_REPAINT`].
+///
+/// A repaint costs the same whatever the grid holds - the work is the
+/// composition of the tiles and the present, not the pictures, which the store
+/// hands over once each however often it is asked. So past a few tiles most of
+/// the repaints a waker asks for draw exactly what the last one drew, and the
+/// timer is both cheaper and sufficient: twenty-five a second covers the fifteen
+/// to twenty-five these cameras send.
+///
+/// Measured on the N5095 box with ten cameras, four cores: 78% of the process
+/// with the waker off, 113% with it on, and the pictures arriving twenty times a
+/// second the whole time. Four is where a tile is still large enough for the
+/// twenty-five hertz timer to be the thing the eye sees missing.
+const FRAME_PACED_TILES: usize = 4;
 
 /// Width the toolbar is laid out for at its full size.
 ///
@@ -180,15 +204,6 @@ struct Chrome {
     /// rectangle they were drawn in is the only description of where it is.
     /// `None` until they have been drawn once.
     bars: Option<(Rect, Rect)>,
-    /// Swallow the primary gesture that revealed Clean View's controls,
-    /// including its release on a later frame.
-    consume_primary: bool,
-    /// Back reveals controls before it can unwind the wall this frame.
-    reveal_back: bool,
-    /// An interaction ending starts a fresh countdown even without intervening frames.
-    clean_held: bool,
-    /// The reveal click must not count as the first half of a tile double-click.
-    reveal_double_click_until: f64,
 }
 
 /// The bar an arrow walked off the wall for.
@@ -211,7 +226,7 @@ pub struct ChannelTexture {
 #[derive(Debug, Clone)]
 pub struct ChannelUi {
     pub state: ConnectionState,
-    pub detail: String,
+    pub detail: Option<Diagnostic>,
     /// Stream currently decoded.
     pub stream: Option<StreamKind>,
     pub codec: Option<String>,
@@ -241,6 +256,13 @@ pub struct ChannelUi {
     pub fps: f32,
     pub bitrate_kbps: f32,
     pub total_frames: u64,
+    /// Whether this camera is being recorded, from the periodic Frigate read.
+    ///
+    /// `None` means the camera has no Frigate origin and no square is drawn;
+    /// `Some(true)` is a red square, `Some(false)` a grey one. Carried on the
+    /// channel so the OSD, which is drawn from `ChannelUi`, needs no separate
+    /// map lookup in the grid.
+    pub recording: Option<bool>,
     /// Stream decoded before the current switch. While it is set the viewport
     /// keeps the last frame of that stream instead of showing a black frame.
     pub switching_from: Option<StreamKind>,
@@ -254,7 +276,7 @@ impl Default for ChannelUi {
     fn default() -> Self {
         Self {
             state: ConnectionState::Idle,
-            detail: String::new(),
+            detail: None,
             stream: None,
             codec: None,
             hardware: false,
@@ -266,6 +288,7 @@ impl Default for ChannelUi {
             fps: 0.0,
             bitrate_kbps: 0.0,
             total_frames: 0,
+            recording: None,
             switching_from: None,
             stats_sequence: 0,
         }
@@ -414,6 +437,14 @@ struct Toast {
     /// on, so it says it in the one place a viewer looking at the picture
     /// already is; the news a channel reports stays where it has always been.
     center: bool,
+}
+
+/// Which page of the layout picker the viewer is on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum PickerTab {
+    #[default]
+    Presets,
+    Custom,
 }
 
 /// Page of the settings side panel.
@@ -957,11 +988,11 @@ fn layout_hint(layout: GridLayout) -> &'static str {
         GridLayout::N10 => "toolbar-layout-10",
         GridLayout::N12 => "toolbar-layout-12",
         GridLayout::N13 => "toolbar-layout-13",
-        GridLayout::Custom { .. } => "settings-grid-custom",
         GridLayout::P1 => "toolbar-layout-p1",
         GridLayout::P2 => "toolbar-layout-p2",
         GridLayout::P3 => "toolbar-layout-p3",
         GridLayout::P4 => "toolbar-layout-p4",
+        GridLayout::Custom(_) => "toolbar-layout-custom",
     }
 }
 
@@ -972,6 +1003,20 @@ fn layout_hint(layout: GridLayout) -> &'static str {
 /// See the `Nav::new` call in [`XgViewApp::new`].
 const LAYOUT_PICKER_ROWS: [&str; 3] =
     ["layout-picker-row-0", "layout-picker-row-1", "layout-picker-row-2"];
+
+/// The editor's preview grid is one navigation scope per baseline row, so
+/// Up/Down walk straight to the cell above or below instead of leaving the
+/// grid. Cells that span rows belong to their top row; empty rows are passed
+/// through by `Nav::enter`.
+const LAYOUT_EDITOR_GRID_ROWS: [&str; 7] = [
+    "layout-editor-grid-row-0",
+    "layout-editor-grid-row-1",
+    "layout-editor-grid-row-2",
+    "layout-editor-grid-row-3",
+    "layout-editor-grid-row-4",
+    "layout-editor-grid-row-5",
+    "layout-editor-grid-row-6",
+];
 
 /// Keyboard / DPAD keys consumed during one frame.
 #[derive(Debug, Clone, Copy, Default)]
@@ -997,6 +1042,68 @@ struct Keys {
     layout: [bool; 10],
 }
 
+/// Incoming video traffic sampled for the About page.
+#[derive(Debug, Default)]
+struct NetworkTraffic {
+    /// (instant, running byte total) snapshots, oldest first. The byte total
+    /// comes from `StatsStore`, which only climbs; a rate is the difference
+    /// between two snapshots over the time between them, so no rate has to be
+    /// published or sampled at the sessions' own cadence.
+    samples: std::collections::VecDeque<(Instant, u64)>,
+}
+impl NetworkTraffic {
+    const WINDOW: Duration = Duration::from_secs(60);
+    /// A window long enough to span a whole statistics period (two seconds)
+    /// even with a single channel, whose bytes arrive in one step per period.
+    const CURRENT_WINDOW: Duration = Duration::from_secs(3);
+    const INTERVAL: Duration = Duration::from_secs(1);
+
+    /// Takes a snapshot of the global byte counter, about once a second.
+    fn sample(&mut self, now: Instant, total_bytes: u64) {
+        if let Some((last_at, _)) = self.samples.back() {
+            if now.saturating_duration_since(*last_at) < Self::INTERVAL {
+                return;
+            }
+        }
+        self.samples.push_back((now, total_bytes));
+        let cutoff = now.checked_sub(Self::WINDOW).unwrap_or(now);
+        while self.samples.len() > 1 && self.samples[1].0 <= cutoff {
+            self.samples.pop_front();
+        }
+    }
+
+    /// Megabits per second over `window`, as bytes added divided by the time
+    /// they took to arrive. When the counter stops climbing the rate is zero,
+    /// which is what a stream that has gone quiet should read; no gap
+    /// detection or history clearing is needed.
+    fn rate_mbps(&self, window: Duration) -> f32 {
+        let Some(&(newest_at, newest_bytes)) = self.samples.back() else {
+            return 0.0;
+        };
+        let cutoff = newest_at.checked_sub(window).unwrap_or(newest_at);
+        let base = self.samples.iter()
+            .find(|(at, _)| *at >= cutoff)
+            .copied()
+            .or_else(|| self.samples.front().copied());
+        let Some((base_at, base_bytes)) = base else {
+            return 0.0;
+        };
+        if newest_at <= base_at || newest_bytes < base_bytes {
+            return 0.0;
+        }
+        let seconds = newest_at.duration_since(base_at).as_secs_f32();
+        ((newest_bytes - base_bytes) as f32 * 8.0 / 1_000_000.0) / seconds
+    }
+
+    fn current_mbps(&self) -> f32 {
+        self.rate_mbps(Self::CURRENT_WINDOW)
+    }
+
+    fn average_mbps(&self) -> f32 {
+        self.rate_mbps(Self::WINDOW)
+    }
+}
+
 /// The viewer application.
 pub struct XgViewApp {
     config: AppConfig,
@@ -1007,6 +1114,14 @@ pub struct XgViewApp {
     manager: ChannelManager,
     handle: Handle,
     channels: HashMap<usize, ChannelUi>,
+    /// Whether each Frigate camera is recording, keyed by camera id, from the
+    /// periodic segment read. Only cameras with a Frigate origin get an entry;
+    /// a missing key means no answer yet, which the tile draws as a grey square.
+    recording: HashMap<String, bool>,
+    /// When the next recording-state read is due. Answers are a few seconds
+    /// stale by nature, so a half-minute tick costs nothing and keeps the
+    /// red square honest without a poll per frame.
+    recording_poll_at: Instant,
     /// The audio devices this machine offered when the viewer started.
     ///
     /// Read once, before the sink opens, and never again: opening a device makes
@@ -1051,6 +1166,8 @@ pub struct XgViewApp {
     /// The machine's memory, processor load and operating system, read while the
     /// About page is open; see `monitor_core::vitals`.
     vitals: monitor_core::vitals::Vitals,
+    /// Incoming bitrate sampled for the About page.
+    network_traffic: NetworkTraffic,
     /// When this viewer started, for the About page's uptime.
     started: Instant,
     /// Measures the frame, when `XGVIEW_FRAME_MS` asks it to.
@@ -1134,6 +1251,13 @@ pub struct XgViewApp {
     /// Whether the layout picker is open: the panel that offers the layouts
     /// that have no button of their own.
     layout_picker: Modal<()>,
+    /// Which tab the layout picker shows. `None` until it is first drawn in
+    /// this opening; the first frame picks the tab holding the current layout
+    /// so reopening after choosing a custom grid lands on that page.
+    layout_picker_tab: Option<PickerTab>,
+    /// The editor for a viewer-drawn grid, opened from the picker's "+" and
+    /// pencil buttons. Its payload is the preview under construction.
+    layout_editor: Modal<EditorState>,
     /// Tab the settings panel is on.
     settings_tab: SettingsTab,
     /// First control of the settings panel, so the panel can be handed the
@@ -1544,6 +1668,8 @@ mod chrome;
 mod download;
 mod file_picker;
 mod input;
+mod layout_editor;
+use layout_editor::EditorState;
 mod paging;
 mod persist;
 #[cfg(target_os = "android")]
@@ -1551,12 +1677,27 @@ pub use persist::public_download_dir;
 pub use persist::EXPORT_SUBFOLDER;
 mod playback;
 use playback::Source;
+mod recording;
 use download::{DownloadChoice, DownloadState};
 mod pickers;
 mod settings;
 mod streams;
 mod wall;
 mod windows;
+
+/// Whether a channel event ends a recording, and if so whether the stop was a
+/// hole in it. A clean finish carries no detail; the hole is named explicitly
+/// by its diagnostic. Kept apart from the event loop so the two can be told
+/// apart in a test: confusing them undoes a seek that landed in a hole, and a
+/// recording that ran to its end would hop on to the next stretch.
+fn finished_recording_stop(event: &StreamEvent) -> Option<bool> {
+    match event {
+        StreamEvent::State { state: ConnectionState::Finished, detail, .. } => {
+            Some(matches!(detail, Some(Diagnostic::NothingThere)))
+        }
+        _ => None,
+    }
+}
 
 impl XgViewApp {
     /// Draws one window: takes its payload, hands it to `body`, and puts it back
@@ -1608,6 +1749,7 @@ impl XgViewApp {
         slot: impl Fn(&mut Self) -> &mut Modal<T>,
         body: impl FnOnce(&mut Self, &mut egui::Ui, &mut T) -> Answer,
     ) -> Answer {
+        let width = modal_width(width, ctx.screen_rect().width());
         self.modal_lifecycle(slot, |app, payload| {
             let mut answer = Answer::STAY;
             egui::Modal::new(Id::new(id)).show(ctx, |ui| {
@@ -1759,10 +1901,27 @@ impl XgViewApp {
             // scope of its own, and Down / Up cross between them at the same
             // column. The sideways arrows walk a row, so a press at either
             // end is spent rather than wrapping.
-            ("layout-picker-row-0", ScopeDef::new(Axis::Row).exit(Dir::Down, Exit::ScopeAt("layout-picker-row-1"))),
+            ("layout-picker-row-0", ScopeDef::new(Axis::Row).exit(Dir::Up, Exit::Scope("layout-picker-tabs")).exit(Dir::Down, Exit::ScopeAt("layout-picker-row-1"))),
             ("layout-picker-row-1", ScopeDef::new(Axis::Row).exit(Dir::Up, Exit::ScopeAt("layout-picker-row-0")).exit(Dir::Down, Exit::ScopeAt("layout-picker-row-2"))),
-            ("layout-picker-row-2", ScopeDef::new(Axis::Row).exit(Dir::Up, Exit::ScopeAt("layout-picker-row-1")).exit(Dir::Down, Exit::Scope("layout-picker-custom"))),
-            ("layout-picker-custom", ScopeDef::new(Axis::Column).exit(Dir::Up, Exit::Scope("layout-picker-row-2"))),
+            ("layout-picker-row-2", ScopeDef::new(Axis::Row).exit(Dir::Up, Exit::ScopeAt("layout-picker-row-1"))),
+            ("layout-picker-tabs", ScopeDef::new(Axis::Row).exit(Dir::Down, Exit::Scope("layout-picker-row-0"))),
+            // The custom-grid editor is one page: baseline rows, baseline
+            // columns, a preview grid with one scope per baseline row, then
+            // the confirm row. Left/Right walk the cells of a row; Up/Down
+            // cross to the same seat in the row above or below. Back leaves
+            // through the modal. The entry is an invisible focus target on
+            // the hint: opening the page shows no ring until a key moves it.
+            ("layout-editor-entry", ScopeDef::new(Axis::Row).exit(Dir::Down, Exit::Scope("layout-editor-rows")).exit(Dir::Right, Exit::Scope("layout-editor-rows"))),
+            ("layout-editor-rows", ScopeDef::new(Axis::Row).exit(Dir::Down, Exit::Scope("layout-editor-columns"))),
+            ("layout-editor-columns", ScopeDef::new(Axis::Row).exit(Dir::Up, Exit::Scope("layout-editor-rows")).exit(Dir::Down, Exit::Scope("layout-editor-grid-row-0"))),
+            ("layout-editor-grid-row-0", ScopeDef::new(Axis::Row).exit(Dir::Up, Exit::Scope("layout-editor-columns")).exit(Dir::Down, Exit::ScopeAt("layout-editor-grid-row-1"))),
+            ("layout-editor-grid-row-1", ScopeDef::new(Axis::Row).exit(Dir::Up, Exit::ScopeAt("layout-editor-grid-row-0")).exit(Dir::Down, Exit::ScopeAt("layout-editor-grid-row-2"))),
+            ("layout-editor-grid-row-2", ScopeDef::new(Axis::Row).exit(Dir::Up, Exit::ScopeAt("layout-editor-grid-row-1")).exit(Dir::Down, Exit::ScopeAt("layout-editor-grid-row-3"))),
+            ("layout-editor-grid-row-3", ScopeDef::new(Axis::Row).exit(Dir::Up, Exit::ScopeAt("layout-editor-grid-row-2")).exit(Dir::Down, Exit::ScopeAt("layout-editor-grid-row-4"))),
+            ("layout-editor-grid-row-4", ScopeDef::new(Axis::Row).exit(Dir::Up, Exit::ScopeAt("layout-editor-grid-row-3")).exit(Dir::Down, Exit::ScopeAt("layout-editor-grid-row-5"))),
+            ("layout-editor-grid-row-5", ScopeDef::new(Axis::Row).exit(Dir::Up, Exit::ScopeAt("layout-editor-grid-row-4")).exit(Dir::Down, Exit::ScopeAt("layout-editor-grid-row-6"))),
+            ("layout-editor-grid-row-6", ScopeDef::new(Axis::Row).exit(Dir::Up, Exit::ScopeAt("layout-editor-grid-row-5")).exit(Dir::Down, Exit::Scope("layout-editor-actions"))),
+            ("layout-editor-actions", ScopeDef::new(Axis::Row).exit(Dir::Up, Exit::ScopeAt("layout-editor-grid-row-6"))),
             ("status", ScopeDef::new(Axis::Row)),
             ("edit-body", ScopeDef::new(Axis::Column)),
             ("confirm-body", ScopeDef::new(Axis::Column)),
@@ -1793,6 +1952,8 @@ impl XgViewApp {
             manager,
             handle,
             channels: HashMap::new(),
+            recording: HashMap::new(),
+            recording_poll_at: Instant::now(),
             audio_outputs,
             audio_inputs,
             talk_route: HashMap::new(),
@@ -1803,6 +1964,7 @@ impl XgViewApp {
             picture_layer_held: false,
             video,
             vitals: monitor_core::vitals::Vitals::new(),
+            network_traffic: NetworkTraffic::default(),
             started: Instant::now(),
             frame_clock: crate::frame::FrameClock::from_env(),
             events_tx,
@@ -1825,6 +1987,8 @@ impl XgViewApp {
             decoder_selectable: capabilities.selectable,
             show_settings: false,
             layout_picker: Modal::default(),
+            layout_picker_tab: None,
+            layout_editor: Modal::default(),
             settings_tab: SettingsTab::default(),
             settings_anchor: None,
             settings_handoff: Handoff::default(),
@@ -1854,10 +2018,6 @@ impl XgViewApp {
                 hide_now: false,
                 input_seen: false,
                 bars: None,
-                consume_primary: false,
-                reveal_back: false,
-                clean_held: false,
-                reveal_double_click_until: f64::NEG_INFINITY,
             },
             toolbar_items: Vec::new(),
             page_prev_id: None,
@@ -1978,6 +2138,8 @@ impl XgViewApp {
             self.camera_edit.anchor
         } else if self.discovery.open {
             self.discovery.focus_anchor
+        } else if self.layout_editor.is_open() {
+            self.layout_editor.anchor
         } else if self.layout_picker.is_open() {
             self.layout_picker.anchor
         } else if self.portrait_aspect_picker.is_open() {
@@ -2030,6 +2192,7 @@ impl XgViewApp {
     /// that covers the picture, not for one that sits beside it.
     pub fn floating_layer_open(&self, ctx: &egui::Context) -> bool {
         if self.discovery.open
+            || self.layout_editor.is_open()
             || self.layout_picker.is_open()
             || self.portrait_aspect_picker.is_open()
             || self.combined_info_picker.is_open()
@@ -2166,6 +2329,21 @@ impl XgViewApp {
         }
     }
 
+    /// Snapshot the global received-byte counter for the About page. Unlike
+    /// summing each channel's published rate, one counter cannot be sampled
+    /// out of phase with a session's two-second window, and a channel that
+    /// closes between samples cannot leave a stale rate behind.
+    fn update_network_traffic(&mut self) {
+        let now = Instant::now();
+        if self.network_traffic.samples.back()
+            .is_some_and(|(at, _)| now.duration_since(*at) < NetworkTraffic::INTERVAL)
+        {
+            return;
+        }
+        let total_bytes = self.manager.stats().total_bytes();
+        self.network_traffic.sample(now, total_bytes);
+    }
+
     fn poll_events(&mut self, ctx: &egui::Context) {
         for event in self.manager.poll() {
             // A camera's answer, not a channel's: it is kept by address so that
@@ -2197,14 +2375,9 @@ impl XgViewApp {
             // not drawn as a broken camera (see `pipeline::channel`), and the
             // reason is the only thing that tells the two apart - a clean finish
             // carries none.
-            let (stopped, nothing_there) = match &event {
-                StreamEvent::State { state: ConnectionState::Finished, detail, .. } => {
-                    (true, !detail.is_empty())
-                }
-                _ => (false, false),
-            };
+            let stopped = finished_recording_stop(&event);
             self.channels.entry(index).or_default().apply(event);
-            if stopped {
+            if let Some(nothing_there) = stopped {
                 self.recording_stopped(index, nothing_there);
             }
         }
@@ -2367,6 +2540,13 @@ impl XgViewApp {
                         *to,
                         segments.clone(),
                     );
+                }
+                BackgroundEvent::RecordingStatus { camera_id, active } => {
+                    // A failed read says nothing new: keep the last answer so a
+                    // network blink does not turn a recording camera grey.
+                    if let Some(active) = active {
+                        self.recording.insert(camera_id.clone(), *active);
+                    }
                 }
                 BackgroundEvent::Go2rtcFailed(error) => {
                     toast = Some((
@@ -2641,7 +2821,67 @@ impl XgViewApp {
     /// than the `eframe::App` one because two things drive it: eframe on the
     /// desktop, and - on Android - the loop in `crate::android_surface`, which
     /// owns a `SurfaceView`'s surface instead of an activity window.
+    ///
+    /// Teaches the frame store to wake this wall when a picture lands, on the
+    /// views where that is worth a repaint per picture. The two front ends are
+    /// woken differently: the Android loop waits on a condition variable of its
+    /// own and only a call to `wake` cuts that wait short, while an egui context
+    /// in either front end repaints when asked directly. See
+    /// [`FrameStore::set_wake`].
+    fn paint_on_the_stream(&self, ctx: &egui::Context) {
+        if !self.wants_frame_paced_repaint() {
+            // A grid keeps the timer it always had. Leaning on it again is not
+            // an optimisation to be measured later: it is the difference
+            // between 78% and 113% of a four core box on a ten camera wall,
+            // measured on this project's own N5095 (`priv/docs/grid-cpu-cost.md`
+            // §10), for a screen that can only show sixty of the two hundred
+            // pictures a second that arrive.
+            self.manager.frames().clear_wake();
+            return;
+        }
+        #[cfg(target_os = "android")]
+        let waker: Arc<dyn Fn() + Send + Sync> = {
+            // The Android loop waits on a condition variable of its own and an
+            // egui context cannot cut that wait short, so the context is not
+            // the way to reach it here.
+            let _ = ctx;
+            Arc::new(crate::android_surface::wake)
+        };
+        #[cfg(not(target_os = "android"))]
+        let waker: Arc<dyn Fn() + Send + Sync> = {
+            let ctx = ctx.clone();
+            Arc::new(move || ctx.request_repaint())
+        };
+        self.manager.frames().set_wake(waker);
+    }
+
+    /// Whether this view is one to paint on the stream's clock rather than on
+    /// the wall's timer.
+    ///
+    /// A magnified picture and a replay are one large picture each, painted for
+    /// as many cameras as there are - one. The wall shows up to
+    /// [`FRAME_PACED_TILES`] of them the same way, and past that the timer is
+    /// the cheaper answer: its twenty-five repaints a second already cover the
+    /// fifteen to twenty five a second these cameras send, and the extra ones a
+    /// waker asks for draw what the last one drew.
+    fn wants_frame_paced_repaint(&self) -> bool {
+        if self.scheduler.is_zoomed() || self.playback.is_some() {
+            return true;
+        }
+        let live = self.scheduler.current().map_or(0, |schedule| schedule.live().count());
+        live <= FRAME_PACED_TILES
+    }
+
     pub fn frame(&mut self, ctx: &egui::Context) {
+        // The wall paints when a picture lands rather than on a timer. A twelve
+        // frame stream is eighty-three milliseconds a frame, and the
+        // forty-millisecond timer the wall runs on otherwise shows each picture
+        // for two of those waits or for three by turns - a rhythm the eye reads
+        // as stutter even when the pictures themselves were placed perfectly.
+        // Reinstalled every frame because it is one lock and one clone, and
+        // because a context that was rebuilt would otherwise leave the store
+        // waking a dead one.
+        self.paint_on_the_stream(ctx);
         let start = self.begin_frame(ctx);
         // Before anything asks whether the picture is on its own layer: a step
         // to another camera has to be noticed in the same frame it happens.
@@ -2901,6 +3141,7 @@ impl XgViewApp {
         // is still in flight for a frame or two, and would confirm the control
         // the window has just been given. See `swallow_confirm`.
         let mut opened = false;
+        opened |= self.layout_editor.hand_off(ctx, false);
         opened |= self.camera_edit.hand_off(ctx, true);
         opened |= self.remove_confirm.hand_off(ctx, false);
         opened |= self.system_confirm.hand_off(ctx, false);
@@ -2943,27 +3184,38 @@ impl XgViewApp {
         // it. The panel's anchor answers only when there was nothing to put
         // back.
         let anchor = self.panel_anchor();
-        if ctx.memory(|memory| memory.focused()).is_none() && !self.file_dialog_open() {
-            // A value control confirms with Enter and gives the focus up as the
-            // form is drawn. The form hands it to the next control rather than
-            // back to the tab strip, and only the last control falls through to
-            // the anchor.
-            let confirmed = ctx.input(|input| input.key_pressed(Key::Enter));
-            let next = focus_before
-                .filter(|_| confirmed)
-                .and_then(|before| self.nav.next_in_scope(before));
-            match next {
-                Some(next) => {
-                    ctx.memory_mut(|memory| memory.request_focus(next));
-                    // It was drawn before the focus reached it: the reveal is
-                    // armed at the start of the next frame.
-                    self.reveal_next = Some(next);
-                }
-                None => {
-                    let restore = focus_before.filter(|id| self.nav.owns_now(*id)).or(anchor);
-                    if let Some(id) = restore {
-                        ctx.memory_mut(|memory| memory.request_focus(id));
-                    }
+        if ctx.memory(|memory| memory.focused()).is_none() {
+            // A control that greyed out as the frame was drawn cannot hold
+            // the ring: egui gives up its focus, and the arrows would stop
+            // there. Its next live neighbour takes it over, the same way a
+            // form passes the focus on from a field that confirms. This is
+            // not a panel repair - the file picker owns its own focus - but
+            // a grey stop there is just as dead as one in a panel.
+            let grey_next = focus_before
+                .filter(|before| self.nav.went_grey(*before))
+                .and_then(|before| self.nav.grey_handoff(before));
+            // The file picker keeps its own focus rules; only the panels and
+            // windows above take an Enter hand-off and an anchor fallback.
+            let form_next = if self.file_dialog_open() {
+                None
+            } else if ctx.input(|input| input.key_pressed(Key::Enter)) {
+                focus_before.and_then(|before| self.nav.next_in_scope(before))
+            } else {
+                None
+            };
+            let next = grey_next.or(form_next).and_then(|id| self.nav.live(id));
+            if let Some(next) = next {
+                ctx.memory_mut(|memory| memory.request_focus(next));
+                // It was drawn before the focus reached it: the reveal is
+                // armed at the start of the next frame.
+                self.reveal_next = Some(next);
+            } else if !self.file_dialog_open() {
+                let restore = focus_before
+                    .and_then(|id| self.nav.live(id).or(Some(id)))
+                    .filter(|id| self.nav.owns_now(*id))
+                    .or_else(|| anchor.and_then(|id| self.nav.live(id)));
+                if let Some(id) = restore {
+                    ctx.memory_mut(|memory| memory.request_focus(id));
                 }
             }
         }
@@ -3329,13 +3581,73 @@ impl XgViewApp {
         }
     }
 
+    /// Copy the recording answer onto every channel showing that camera.
+    ///
+    /// Run each frame: a camera change, a group change or a late answer all
+    /// settle here without each having to remember to update the OSD. A camera
+    /// with no Frigate origin gets `None`, which draws no square at all.
+    fn apply_recording(&mut self) {
+        let slots = self.config.active_slots();
+        for (index, channel) in self.channels.iter_mut() {
+            let camera = slots.get(*index).and_then(|slot| self.config.cameras.get(*slot));
+            channel.recording = camera.and_then(|camera| {
+                camera.frigate.as_ref()?;
+                Some(self.recording.get(&camera.id).copied().unwrap_or(false))
+            });
+        }
+    }
+
+    /// Ask each Frigate camera whether it is recording, one task per camera.
+    ///
+    /// The answers come back through [`BackgroundEvent::RecordingStatus`] and
+    /// land in `self.recording` on a later frame. One read per tick, never one
+    /// per frame: the recorder itself only decides every ten seconds. A camera
+    /// that is not from Frigate is never asked and draws no square at all.
+    fn poll_recording_status(&mut self, ctx: &egui::Context) {
+        let now = Instant::now();
+        if now < self.recording_poll_at {
+            return;
+        }
+        self.recording_poll_at = now + RECORDING_POLL;
+
+        let epoch = recording::epoch_now();
+        // Ask by origin, not by slot: a camera shown twice is the same camera
+        // and its answer is keyed by id, so one task is enough for both slots.
+        let mut asked: HashSet<String> = HashSet::new();
+        for camera in &self.config.cameras {
+            if !camera.enabled {
+                continue;
+            }
+            let Some(origin) = camera.frigate.clone() else {
+                continue;
+            };
+            if !asked.insert(camera.id.clone()) {
+                continue;
+            }
+            let credentials = camera
+                .mse_username
+                .clone()
+                .map(|user| (user, camera.mse_password.clone().unwrap_or_default()));
+            recording::poll_one(
+                &self.handle,
+                &self.events_tx,
+                camera.id.clone(),
+                origin,
+                credentials,
+                epoch,
+            );
+        }
+        // The next tick needs a frame to run in even on a still wall: a paused
+        // recording or a frozen camera asks for no repaints of its own.
+        ctx.request_repaint_after(RECORDING_POLL);
+    }
+
     /// What the background jobs answered since the last frame, and the press in
     /// flight - both read before anything is drawn.
     ///
     /// `poll_events` is the manager's queue; this is everything that has to be
     /// in hand before a widget is drawn, which includes it.
     pub(super) fn collect_events(&mut self, ctx: &egui::Context) {
-        self.collect_clean_view_input(ctx);
         // Read before the keys are handed out: `handle_keys` takes the ones the
         // application acts on out of the queue, and the bars still have to know
         // a viewer was there. What counts as asking for them is the whole of
@@ -3343,9 +3655,7 @@ impl XgViewApp {
         self.chrome.input_seen = self.viewer_active(ctx);
         // And the press in flight is tracked before anything is drawn: the
         // release that closes the magnified viewport's bar is read against it.
-        if !self.chrome.consume_primary {
-            self.track_tap(ctx);
-        }
+        self.track_tap(ctx);
         // A tap asks for the strip, but only once egui's double-click window has
         // passed: the second tap of a double press is the way back to the grid,
         // and the first must not put the strip on screen on its way there. See
@@ -3362,7 +3672,10 @@ impl XgViewApp {
             }
         }
 
+        self.poll_recording_status(ctx);
         self.poll_events(ctx);
+        self.update_network_traffic();
+        self.apply_recording();
         self.poll_sealing();
         self.poll_talk_test();
         // An answer comes back with the wall drawn a frame or two after it was
@@ -3437,17 +3750,10 @@ impl XgViewApp {
         // *before* the bars are asked for, because the frame a press in a band
         // brings them back in is one of the frames that has to claim it.
         let bands_hidden = !self.chrome.visible;
-        let bars = self.chrome_visible(ctx);
+        let bars = self.chrome_visible();
         if bars {
-            let enabled = !self.chrome.consume_primary;
-            let toolbar = egui::TopBottomPanel::top("xgview-toolbar").show(ctx, |ui| {
-                if !enabled { ui.disable(); }
-                self.toolbar(ui);
-            });
-            let status = egui::TopBottomPanel::bottom("xgview-status").show(ctx, |ui| {
-                if !enabled { ui.disable(); }
-                self.status_bar(ui);
-            });
+            let toolbar = egui::TopBottomPanel::top("xgview-toolbar").show(ctx, |ui| self.toolbar(ui));
+            let status = egui::TopBottomPanel::bottom("xgview-status").show(ctx, |ui| self.status_bar(ui));
             // Kept past this frame, when the bars are gone: the band a bar
             // occupies is the pointer's way of asking for it back. See
             // `Chrome::bars`.
@@ -3481,7 +3787,7 @@ impl XgViewApp {
         // under it is what has to see the press: these overlays are exactly
         // where that bar is drawn, so one of them would eat the press before the
         // tile could open it. See `crate::tilebar` and `wall_event`.
-        if bands_hidden && !self.config.clean_view && !self.scheduler.is_zoomed() {
+        if bands_hidden && !self.scheduler.is_zoomed() {
             // Held to this frame's screen: the rectangles are from the frame the
             // bars were last drawn in, and a window made full screen since has
             // bands at the top and bottom of a taller screen than those - an
@@ -3515,34 +3821,6 @@ impl XgViewApp {
                 .default_width(SETTINGS_WIDTH)
                 .min_width(SETTINGS_MIN_WIDTH)
                 .show(ctx, |ui| self.settings_panel(ui));
-
-            // The pointer's way out of the panel: a click anywhere on the wall
-            // beside it. A remote control and a keyboard have Back and Escape,
-            // which say "close the panel" from wherever the focus happens to
-            // be; a mouse or a finger has only the gear that opened it, and a
-            // control that opens something is not read as the one that closes
-            // it either.
-            //
-            // The press is taken by a layer over the wall rather than read
-            // from the input queue, so that the click which dismisses the
-            // panel cannot also land on the tile under the pointer - a click
-            // on the wall magnifies that channel, and closing the panel while
-            // zooming into a picture behind it is not what the viewer asked
-            // for. The layer stops short of the bars: they keep working while
-            // the panel is open, and the gear closes it by itself.
-            //
-            // Its rect is what the central panel is about to be given, so it
-            // covers the wall and nothing else - the panel has just been laid
-            // out, and the bars before it.
-            let wall = ctx.available_rect();
-            let dismissed = egui::Area::new(Id::new("xgview-settings-dismiss"))
-                .order(egui::Order::Middle)
-                .fixed_pos(wall.min)
-                .show(ctx, |ui| ui.allocate_rect(wall, egui::Sense::click()).clicked())
-                .inner;
-            if dismissed {
-                self.show_settings = false;
-            }
         }
 
         egui::CentralPanel::default()
@@ -3555,7 +3833,6 @@ impl XgViewApp {
                 theme::BACKGROUND
             }))
             .show(ctx, |ui| {
-                if self.chrome.consume_primary { ui.disable(); }
                 let area = ui.available_rect_before_wrap();
                 self.draw_grid(ui);
                 // The floating page arrows sit at the very edges the magnified
@@ -3584,9 +3861,15 @@ impl XgViewApp {
                 &handle,
                 &events,
                 &mut self.nav,
+                &mut self.body_scroll,
             ) {
                 self.needs_sync = true;
                 self.mark_dirty();
+            }
+            // A form press has no background event to answer it, so its error
+            // is handed here for the same toast the discovery jobs get.
+            if let Some(error) = self.discovery.toast_error.take() {
+                self.flash(error, ToastKind::Error);
             }
             // The manual tab's test button: the dialog has no runtime, so the
             // press comes back here and is played like the edit window's.
@@ -3617,6 +3900,49 @@ impl XgViewApp {
         self.download_panel_window(ctx);
 
         self.draw_layout_picker(ctx);
+        // The editor sits above the picker: a confirm writes the preview into
+        // its slot, Delete clears the slot, and changes to the wall happen
+        // only when that slot was the layout on screen. Back drops the
+        // preview entirely. Either way the Custom page comes back underneath,
+        // so the ring always has a control to land on.
+        if self.layout_editor.is_open() {
+            let (_, finished) = self.draw_layout_editor(ctx);
+            if let Some(state) = finished {
+                let slot = state.slot.min(3);
+                if state.delete {
+                    // Delete clears the slot and leaves the picker on its
+                    // empty card. The ring goes to that card only when the
+                    // editor was opened with one.
+                    self.config.group_mut().custom_layouts[slot] = None;
+                    self.mark_dirty();
+                    if let Some(id) = state.slot_focus {
+                        self.restore_focus = Some(id);
+                    }
+                } else {
+                    let grid = state.grid;
+                    let active = matches!(
+                        self.scheduler.layout(),
+                        GridLayout::Custom(current) if Some(current) == self.config.group().custom_layouts[slot]
+                    );
+                    self.config.group_mut().custom_layouts[slot] = Some(grid);
+                    if active {
+                        self.set_layout(GridLayout::Custom(grid));
+                    }
+                    self.mark_dirty();
+                    // Confirm puts the ring on the slot just written.
+                    if let Some(id) = state.slot_focus {
+                        self.restore_focus = Some(id);
+                    }
+                }
+            }
+            if !self.layout_editor.is_open() {
+                self.layout_picker.open(());
+                self.layout_picker_tab = Some(PickerTab::Custom);
+                // The editor's origin and the picker's are different things:
+                // the first takes the ring now, the second must survive for
+                // the Back that later closes the picker.
+            }
+        }
         self.draw_portrait_aspect_picker(ctx);
         self.draw_combined_info_picker(ctx);
         self.draw_toast(ctx);
@@ -3640,6 +3966,9 @@ impl XgViewApp {
         let mut what = String::from(if self.scheduler.is_zoomed() { "magnified" } else { "wall" });
         if self.show_settings {
             what.push_str(&format!(" settings={:?}", self.settings_tab));
+        }
+        if self.layout_editor.is_open() {
+            what.push_str(" layout-editor");
         }
         if self.layout_picker.is_open() {
             what.push_str(" layouts");
@@ -3821,6 +4150,81 @@ fn bands_around(outer: Rect, inner: Rect) -> Vec<Rect> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn network_traffic_rates_come_from_byte_differences() {
+        let start = Instant::now();
+        let mut traffic = NetworkTraffic::default();
+
+        assert_eq!(traffic.current_mbps(), 0.0);
+        assert_eq!(traffic.average_mbps(), 0.0);
+
+        // A megabit is 125_000 bytes. Ten seconds at one megabit a second
+        // puts 1_250_000 bytes on the wire.
+        for second in 0..=10 {
+            traffic.sample(start + Duration::from_secs(second), second as u64 * 125_000);
+        }
+        assert!((traffic.current_mbps() - 1.0).abs() < 0.001);
+        assert!((traffic.average_mbps() - 1.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn network_traffic_average_is_the_bytes_over_the_whole_window() {
+        let start = Instant::now();
+        let mut traffic = NetworkTraffic::default();
+
+        // 1 Mbps for the first forty seconds, 2 Mbps for the next thirty:
+        // the sixty-second window is ten through seventy, so it holds
+        // thirty seconds of each and averages 1.5 Mbps. A snapshot at t is
+        // the bytes received before t, hence sample before adding this
+        // second's bytes.
+        let mut total = 0u64;
+        for second in 0..=70 {
+            traffic.sample(start + Duration::from_secs(second), total);
+            total += if second < 40 { 125_000 } else { 250_000 };
+        }
+        assert!((traffic.average_mbps() - 1.5).abs() < 0.001);
+    }
+
+    #[test]
+    fn network_traffic_reads_zero_when_the_counter_stops() {
+        let start = Instant::now();
+        let mut traffic = NetworkTraffic::default();
+
+        for second in 0..=5 {
+            traffic.sample(start + Duration::from_secs(second), second as u64 * 250_000);
+        }
+        assert!((traffic.current_mbps() - 2.0).abs() < 0.001);
+
+        // The wire goes quiet: the counter stops climbing while snapshots go
+        // on, so the current rate falls at once and the minute average does
+        // so once the busy seconds leave its window - no gap bookkeeping.
+        for second in 6..=12 {
+            traffic.sample(start + Duration::from_secs(second), 1_250_000);
+        }
+        assert_eq!(traffic.current_mbps(), 0.0);
+        for second in 13..=80 {
+            traffic.sample(start + Duration::from_secs(second), 1_250_000);
+        }
+        assert_eq!(traffic.average_mbps(), 0.0);
+    }
+
+    #[test]
+    fn network_traffic_keeps_one_snapshot_a_second_and_a_minute_of_them() {
+        let start = Instant::now();
+        let mut traffic = NetworkTraffic::default();
+
+        traffic.sample(start, 0);
+        traffic.sample(start + Duration::from_millis(500), 500_000);
+        assert_eq!(traffic.samples.len(), 1, "a snapshot less than a second later is ignored");
+
+        for second in 1..=120 {
+            traffic.sample(start + Duration::from_secs(second), second as u64 * 125_000);
+        }
+        // One at the start plus at most sixty-one inside the window: the
+        // oldest snapshots past the minute must have been dropped.
+        assert!(traffic.samples.len() <= 62, "snapshots older than the window are dropped");
+    }
+
     use super::*;
     use egui::{Pos2, pos2};
 
@@ -4146,6 +4550,16 @@ mod tests {
         assert_eq!(follows(showing, (0, Some(2)), cursor, true), showing, "an aim keeps it wherever it went");
     }
 
+    /// Every baseline row of a custom grid needs its own navigation scope,
+    /// or the last row of a 7x7 edit cannot be reached from the one above.
+    #[test]
+    fn every_baseline_row_has_a_preview_scope() {
+        assert_eq!(
+            LAYOUT_EDITOR_GRID_ROWS.len(),
+            usize::from(monitor_core::layout::MAX_CUSTOM_DIMENSION)
+        );
+    }
+
     /// The layout picker's nine thumbnails are three rows of three, and the
     /// arrows have to reach all of them: Left / Right walk a row, Up / Down
     /// cross between the rows at the same column. This is the wiring the picker
@@ -4185,10 +4599,31 @@ mod tests {
         assert_eq!(nav.step(ids[0], Dir::Down), Some(ids[3]));
     }
 
-    /// The picker's thumbnails are drawn inside an `egui::Modal`, and the
-    /// hand-off asks for the focus on the first of them. This reproduces that
-    /// shape headlessly: the focus has to land on a thumbnail and stay there,
-    /// or the arrows have nothing to walk.
+    /// The layout picker opens on its tab strip, the same way Settings does:
+    /// a click keeps the ring there, an arrow selects the tab it lands on, and
+    /// the active tab is the anchor the hand-off asks for.
+    #[test]
+    fn the_layout_picker_opens_on_its_active_tab() {
+        let source = include_str!("pickers.rs");
+        assert!(
+            source.contains("app.layout_picker.anchor = Some(ids[slot]);"),
+            "the modal hand-off must ask for the active tab"
+        );
+        assert!(
+            source.contains("response.request_focus();")
+                && source.contains("if let Some(page) = focused {"),
+            "a click keeps the ring on the tab, and an arrow follows it"
+        );
+        assert!(
+            source.contains("app.nav.set_entry(\"layout-picker-tabs\", ids[slot]);"),
+            "Up out of the body returns to the tab in use"
+        );
+    }
+
+    /// The picker's thumbnails are drawn inside an `egui::Modal`. The window
+    /// opens on the tab row now, but Down hands the focus to a thumbnail; this
+    /// reproduces that shape headlessly. The focus has to stay on a thumbnail
+    /// once it is there, or the arrows have nothing to walk.
     #[test]
     fn a_modal_thumbnail_keeps_the_focus_the_handoff_gave_it() {
         let ctx = egui::Context::default();
@@ -4781,6 +5216,69 @@ mod tests {
         assert_eq!(channel.main_size, Some((1920, 1080)), "but the main shape is kept");
     }
 
+    /// A hole in a recording is the only finish that carries a diagnostic; a
+    /// recording that simply ran to its end carries none. The playback code
+    /// reads the difference to decide whether to carry on at the next stretch,
+    /// so the two must never collapse into the same stop.
+    #[test]
+    fn only_a_hole_is_a_finish_that_moves_playback_on() {
+        let finished = |detail| StreamEvent::State {
+            index: 0,
+            camera_id: "cam".to_string(),
+            state: ConnectionState::Finished,
+            detail,
+        };
+
+        assert_eq!(finished_recording_stop(&finished(Some(Diagnostic::NothingThere))), Some(true));
+        assert_eq!(finished_recording_stop(&finished(None)), Some(false));
+        assert_eq!(
+            finished_recording_stop(&finished(Some(Diagnostic::Failed {
+                failure: monitor_core::pipeline::Failure::unclassified("stream closed by peer"),
+            }))),
+            Some(false),
+            "a finish with some other reason is not a hole"
+        );
+        assert_eq!(
+            finished_recording_stop(&StreamEvent::State {
+                index: 0,
+                camera_id: "cam".to_string(),
+                state: ConnectionState::Failed,
+                detail: Some(Diagnostic::NothingThere),
+            }),
+            None,
+            "only a finished channel ends the recording"
+        );
+    }
+
+    /// A modal built for a television keeps its width on a landscape screen
+    /// and is pulled in on an upright phone, never past the screen's edges.
+    #[test]
+    fn a_modal_fits_the_screen_without_changing_on_wide_ones() {
+        // Landscape: wider than every request plus its margins, so unchanged.
+        assert_eq!(modal_width(480.0, 760.0), 480.0);
+        assert_eq!(modal_width(420.0, 760.0), 420.0);
+        assert_eq!(modal_width(480.0, 520.0), 480.0, "520 - 24 clears 480");
+
+        // Upright phone (S23 FE measures about 360pt wide): pulled in to the
+        // screen less two 12pt margins, whichever request it was given. The
+        // margins are kept small so the narrow screen gives the form room.
+        assert_eq!(modal_width(480.0, 360.0), 336.0);
+        assert_eq!(modal_width(380.0, 360.0), 336.0);
+        assert_eq!(modal_width(300.0, 360.0), 300.0, "a request that fits is kept");
+
+        // Taller-than-wide request on a very narrow screen still fits inside it.
+        assert_eq!(modal_width(480.0, 280.0), 256.0);
+        // The floor is never wider than the room the screen gives.
+        assert_eq!(modal_width(480.0, 200.0), 176.0);
+        // The devices dialog is the widest form and draws itself, not through
+        // `modal_frame`: it has to ask for the same clamp itself.
+        assert!(
+            include_str!("../dialogs.rs")
+                .contains("ui.set_width(modal_width(620.0, ctx.screen_rect().width()))"),
+            "the add-devices window must use the same screen clamp"
+        );
+    }
+
     /// The held frame is a promise that a new one is coming. A channel that has
     /// given up cannot keep it, and the band that says so would otherwise stay
     /// over the failure panel - the one thing on the tile still claiming that
@@ -4801,7 +5299,10 @@ mod tests {
             index: 0,
             camera_id: "cam".to_string(),
             state: ConnectionState::Reconnecting,
-            detail: "connection refused | retry in 1000 ms".to_string(),
+            detail: Some(Diagnostic::Reconnecting {
+                failure: monitor_core::pipeline::Failure::unclassified("connection refused"),
+                milliseconds: 1000,
+            }),
         });
         assert_eq!(channel.switching_from, Some(StreamKind::Sub), "a retry still expects a picture");
 
@@ -4810,7 +5311,9 @@ mod tests {
             index: 0,
             camera_id: "cam".to_string(),
             state: ConnectionState::Failed,
-            detail: "SETUP failed: 401 Unauthorized (digest authentication)".to_string(),
+            detail: Some(Diagnostic::Failed {
+                failure: monitor_core::pipeline::Failure::unclassified("SETUP failed: 401 Unauthorized"),
+            }),
         });
         assert_eq!(channel.switching_from, None, "nothing is coming to replace it");
     }
@@ -4971,9 +5474,84 @@ mod tests {
         );
         let leave = rest.find("// Nothing else is a layer").expect("the ring is the last answer");
         let head = &rest[..leave];
-        for panel in ["layout_picker.is_open()", "portrait_aspect_picker.is_open()", "show_settings"] {
+        for panel in ["layout_editor.is_open()", "layout_picker.is_open()", "portrait_aspect_picker.is_open()", "show_settings"] {
             assert!(head.contains(panel), "{panel} is a layer and Back must close it first");
         }
+    }
+
+    /// The layout editor is a page over the Custom picker, not a replacement
+    /// for it. Back leaves the ring on the control that opened it, Confirm on
+    /// the slot it just wrote, and Enter on a preview cell is the remote's
+    /// second merge press.
+    #[test]
+    fn the_layout_editor_hands_the_ring_back_to_the_right_control() {
+        let picker = include_str!("pickers.rs");
+        assert!(
+            picker.contains("Answer::CLOSE_LEAVING_THE_FOCUS"),
+            "opening the editor must not send the ring back to the toolbar"
+        );
+        assert!(picker.contains("layout_editor.from = from"), "Cancel needs the control it came from");
+        assert!(picker.contains("slot_focus"), "Confirm needs the slot the pencil edits");
+        let app = include_str!("mod.rs");
+        assert!(app.contains("state.slot_focus"), "Confirm puts the ring on that slot");
+        assert!(app.contains("PickerTab::Custom"), "both ways out return to the Custom page");
+        let input = include_str!("input.rs");
+        let cleared_origin = format!("{}layout_picker.from = None;", "self.");
+        assert!(
+            !app.contains(&cleared_origin) && !input.contains(&cleared_origin),
+            "visiting the editor must not lose the control that opened the picker"
+        );
+        let editor = include_str!("layout_editor.rs");
+        assert!(
+            app.contains("if state.delete {") && app.contains("custom_layouts[slot] = None"),
+            "Delete clears the edited slot and leaves the picker on its card"
+        );
+        assert!(
+            editor.contains("layout-editor-delete") && editor.contains("let can_delete = !matches!"),
+            "Delete is greyed out while the slot is on the wall"
+        );
+        assert!(
+            editor.contains("payload.split_target_for(focused_cell")
+                && editor.contains("app.restore_focus = Some(ok.id)"),
+            "Split follows the ring only on a cell; a greyed Split hands it to OK"
+        );
+        assert!(
+            app.contains("if active {") && app.contains("set_layout(GridLayout::Custom(grid))"),
+            "Confirm switches the wall only when the edited slot is already on it"
+        );
+        assert!(
+            editor.contains("input::CONFIRM_KEYS") && editor.contains("focused == Some(response.id)"),
+            "Enter on a focused preview cell is a merge press"
+        );
+        assert!(
+            app.contains("layout-editor-grid-row-0")
+                && app.contains("Exit::ScopeAt(\"layout-editor-grid-row-1\")"),
+            "Up/Down cross the preview rows instead of leaving the grid"
+        );
+        assert!(
+            app.contains("(\"layout-editor-entry\", ScopeDef::new(Axis::Row)")
+                && app.contains("layout-editor-entry\", ScopeDef::new(Axis::Row).exit(Dir::Down")
+                && app.contains(".exit(Dir::Right, Exit::Scope(\"layout-editor-rows\"))")
+                && editor.contains("app.layout_editor.anchor = Some(hint_focus.id)")
+                && editor.contains("egui::Sense::focusable_noninteractive()"),
+            "the editor opens on a focus target with no visible ring"
+        );
+        assert!(
+            editor.contains("focus_before == Some(split.id)"),
+            "greying Split hands the ring to the preview, not the dimension row"
+        );
+        assert!(
+            editor.contains("ring_was_on_split || ring_was_on_target"),
+            "a pointer press leaves a ring that was elsewhere alone"
+        );
+        let at = editor.find("for (index, cell)").expect("the preview cell loop");
+        let rest = &editor[at..];
+        let end = rest.find("app.nav.close()").expect("the end of the preview loop");
+        assert_eq!(
+            rest[..end].matches("payload.enter()").count(),
+            1,
+            "one press must take one step, not set the anchor and clear it again"
+        );
     }
 
     /// Up on a pinned strip answers what Back answers: the ring goes and the
@@ -6045,5 +6623,22 @@ mod tests {
         assert!(tail.contains("focus_before"), "the fallback must be there");
         assert!(tail.contains("!self.modal_is_up()"), "a window owns its own focus");
         assert!(tail.contains("self.panel_anchor().is_none()"), "and so does a panel");
+    }
+
+    /// A grey control inside a window or panel is not a stop either. The
+    /// navigation layer drops it from the ring, and the frame that greys it
+    /// hands the ring to the next live control rather than leaving the remote
+    /// on a button that answers nothing.
+    #[test]
+    fn a_grey_control_in_a_window_is_not_the_end_of_the_walk() {
+        let nav = include_str!("../nav.rs");
+        assert!(
+            nav.contains("if !response.enabled()"),
+            "a disabled widget must not be registered as a stop"
+        );
+        let body = include_str!("mod.rs");
+        assert!(body.contains("self.nav.went_grey(*before)"));
+        assert!(body.contains("self.nav.grey_handoff(before)"));
+        assert!(body.contains("self.nav.live(id)"));
     }
 }

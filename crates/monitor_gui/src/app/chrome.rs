@@ -9,91 +9,7 @@ use egui::Color32;
 
 use super::*;
 
-const CLEAN_VIEW_IDLE: Duration = Duration::from_secs(5);
-
-impl Chrome {
-    /// One clock for both window modes. Holding a surface resets the clock on
-    /// every frame, so closing it always leaves a full reading/interaction delay.
-    fn clean_visible(&mut self, now: Instant, held: bool, active: bool) -> bool {
-        self.hide_now = false;
-        if held || self.clean_held || active {
-            self.last_input = now;
-            self.visible = true;
-        } else if now.saturating_duration_since(self.last_input) >= CLEAN_VIEW_IDLE {
-            self.visible = false;
-        }
-        self.clean_held = held;
-        self.visible
-    }
-
-    fn consume_reveal_primary(&mut self, hidden: bool, pressed: bool, down: bool, released: bool) {
-        self.consume_primary = (hidden && pressed)
-            || (self.consume_primary && (down || released));
-    }
-}
-
 impl XgViewApp {
-    /// Capture reveal gestures before the wall or its magnified strip sees them.
-    pub(super) fn collect_clean_view_input(&mut self, ctx: &egui::Context) {
-        self.chrome.reveal_back = false;
-        if !self.config.clean_view {
-            self.chrome.consume_primary = false;
-            self.chrome.clean_held = false;
-            self.chrome.reveal_double_click_until = f64::NEG_INFINITY;
-            return;
-        }
-        let hidden = !self.chrome.visible;
-        let double_click_delay = ctx.options(|options| options.input_options.max_double_click_delay);
-        let released = ctx.input(|input| {
-            let primary = egui::PointerButton::Primary;
-            self.chrome.consume_reveal_primary(
-                hidden,
-                input.pointer.button_pressed(primary),
-                input.pointer.button_down(primary),
-                input.pointer.button_released(primary),
-            );
-            self.chrome.reveal_back = hidden && input.events.iter().any(|event| {
-                matches!(event, egui::Event::Key { key: Key::Escape | Key::BrowserBack | Key::Backspace, pressed: true, .. })
-            });
-            if self.chrome.consume_primary && input.pointer.button_released(primary) {
-                self.chrome.reveal_double_click_until = input.time + double_click_delay;
-            }
-            self.chrome.consume_primary && input.pointer.button_released(primary)
-        });
-        if released {
-            // Enable hit testing again even when no camera is producing frames.
-            ctx.request_repaint();
-        }
-        if self.chrome.consume_primary {
-            self.tap_press = None;
-            self.tap_open_at = None;
-        }
-    }
-
-    fn clean_view_held(&self, ctx: &egui::Context) -> bool {
-        // Keep Context reads outside the input callback: feed workers request
-        // repaints concurrently, and recursively taking its read lock can block
-        // behind a waiting writer while the outer read still owns the lock.
-        let bands = Self::bands(self.chrome.bars, ctx.screen_rect());
-        self.show_settings
-            || self.modal_is_up()
-            || self.file_dialog_keys
-            || self.tile_bar.is_open()
-            || self.exit_armed.is_some_and(|at| at.elapsed() < EXIT_WINDOW)
-            || egui::Popup::is_any_open(ctx)
-            || self.toolbar_has_focus(ctx)
-            || self.status_has_focus(ctx)
-            || (self.chrome.visible && ctx.input(|input| {
-                input.pointer.hover_pos().is_some_and(|pos| {
-                    Self::in_a_bar_band(bands, pos)
-                })
-            }))
-    }
-
-    pub(super) fn clean_view_hidden(&self) -> bool {
-        self.config.clean_view && !self.chrome.visible
-    }
-
     pub(super) fn flash(&mut self, text: impl Into<String>, kind: ToastKind) {
         self.toast = Some(Toast { text: text.into(), kind, at: Instant::now(), center: false });
     }
@@ -229,19 +145,6 @@ impl XgViewApp {
     /// away again 3.5 seconds later. See [`Self::wall_event`] for the whole of
     /// the decision, one event at a time.
     pub(super) fn viewer_active(&self, ctx: &egui::Context) -> bool {
-        if self.config.clean_view {
-            return self.chrome.consume_primary || self.chrome.reveal_back || ctx.input(|input| {
-                input.events.iter().any(|event| match event {
-                    // Movement keeps visible controls awake, but a hidden wall
-                    // waits for a deliberate click or the existing keyboard route.
-                    egui::Event::PointerMoved(_) | egui::Event::MouseMoved(_) => self.chrome.visible,
-                    egui::Event::PointerButton { pressed: true, .. }
-                    | egui::Event::Key { pressed: true, .. } => true,
-                    egui::Event::MouseWheel { .. } | egui::Event::Touch { .. } => self.chrome.visible,
-                    _ => false,
-                })
-            });
-        }
         // Read from this frame's focus rather than from `owner`: Escape is taken
         // by egui as "drop the focus" before this runs, so an answer stored at
         // the end of the last frame still says "the viewer is in the menus" on
@@ -362,8 +265,7 @@ impl XgViewApp {
     /// it stays in sight the whole time - which is how arrows spent in the save
     /// panel lit a box on the recording behind it.
     pub(super) fn ring_shown(&self) -> bool {
-        !self.clean_view_hidden()
-            && Self::ring_visible(self.ring_seen, self.modal_is_up(), Instant::now())
+        Self::ring_visible(self.ring_seen, self.modal_is_up(), Instant::now())
     }
 
     /// [`Self::ring_shown`], with the window and the clock given: the rule we
@@ -432,34 +334,53 @@ impl XgViewApp {
         }
     }
 
-    pub(super) fn chrome_visible(&mut self, ctx: &egui::Context) -> bool {
-        if self.config.clean_view {
-            let now = Instant::now();
-            let held = self.clean_view_held(ctx) || self.config.enabled_count() == 0;
-            let visible = self.chrome.clean_visible(now, held, self.chrome.input_seen);
-            if visible {
-                // No input or incoming video is required to reach the deadline.
-                ctx.request_repaint_after(CLEAN_VIEW_IDLE.saturating_sub(
-                    now.saturating_duration_since(self.chrome.last_input),
-                ));
-            }
-            return visible;
+    /// Whether the current mode may hide the bars after the idle delay. A full
+    /// screen asks the full-screen switch; a desktop window asks the windowed
+    /// one. On Android there is no window mode - `fullscreen == false` is the
+    /// viewer pinning their own bars through `android_pin_bars` - so it never
+    /// hides there, however the windowed switch was left from a desktop config.
+    fn mode_may_hide(fullscreen: bool, clean_fullscreen: bool, clean_windowed: bool) -> bool {
+        if fullscreen {
+            clean_fullscreen
+        } else {
+            !cfg!(target_os = "android") && clean_windowed
         }
+    }
+
+    /// Whether the wall is currently shown without its bars for Clean View.
+    /// Used to take the corner OSD with the bars; the centre status panel is
+    /// feedback and stays, so it is deliberately not part of this.
+    pub(super) fn clean_view_hidden(&self) -> bool {
+        !self.chrome.visible
+            && Self::mode_may_hide(
+                self.fullscreen,
+                self.config.clean_view_fullscreen,
+                self.config.clean_view_windowed,
+            )
+    }
+
+    pub(super) fn chrome_visible(&mut self) -> bool {
         // An open panel owns the bars: taking away the bar of a panel the
         // viewer just opened would strand it. The layout picker is a modal of
         // its own and counts the same way - it is opened from the toolbar, and
         // a bar that faded under it would take its own trigger away.
-        if self.show_settings || self.discovery.open || self.layout_picker.is_open() || self.portrait_aspect_picker.is_open() || self.combined_info_picker.is_open() {
+        if self.show_settings || self.discovery.open || self.layout_editor.is_open() || self.layout_picker.is_open() || self.portrait_aspect_picker.is_open() || self.combined_info_picker.is_open() {
             self.chrome.visible = true;
             self.chrome.hide_now = false;
             self.chrome.last_input = Instant::now();
             return true;
         }
-        // Not full screen: the bars are the point of the mode. On Android that
-        // is all the mode is - the window is full screen either way, and this
-        // is the viewer asking for their own toolbar and status bar to stay
-        // put; see `AppConfig::android_pin_bars`.
-        if !self.fullscreen {
+        // The bars are the point of a mode that Clean View was not asked to
+        // hide in: full screen with its switch off, a desktop window without
+        // the windowed switch, or - on Android - the viewer pinning their own
+        // toolbar and status bar through `android_pin_bars`. On that platform
+        // the window is full screen either way, so `fullscreen == false` is a
+        // request to keep the bars, and `mode_may_hide` is false for it.
+        if !Self::mode_may_hide(
+            self.fullscreen,
+            self.config.clean_view_fullscreen,
+            self.config.clean_view_windowed,
+        ) {
             self.chrome.visible = true;
             self.chrome.hide_now = false;
             return true;
@@ -532,9 +453,6 @@ impl XgViewApp {
         let Some(toast) = &self.toast else {
             return;
         };
-        if self.clean_view_hidden() && toast.kind != ToastKind::Error {
-            return;
-        }
         if toast.at.elapsed() > Duration::from_secs(6) {
             return;
         }
@@ -663,65 +581,32 @@ fn turned_toast_box(tile: egui::Rect, size: egui::Vec2, centered: bool) -> egui:
 }
 
 #[cfg(test)]
-mod clean_view_tests {
+mod clean_view_mode_tests {
     use super::*;
 
-    fn chrome(now: Instant) -> Chrome {
-        Chrome {
-            visible: true,
-            last_input: now,
-            hide_now: false,
-            input_seen: false,
-            bars: None,
-            consume_primary: false,
-            reveal_back: false,
-            clean_held: false,
-            reveal_double_click_until: f64::NEG_INFINITY,
-        }
+    #[test]
+    fn a_mode_without_its_switch_keeps_the_bars() {
+        // Full screen follows its own switch.
+        assert!(XgViewApp::mode_may_hide(true, true, false));
+        assert!(!XgViewApp::mode_may_hide(true, false, true));
+        // Neither mode checked: nothing can hide, even on the desktop.
+        assert!(!XgViewApp::mode_may_hide(true, false, false));
+        assert!(!XgViewApp::mode_may_hide(false, false, false));
     }
 
     #[test]
-    fn clean_view_hides_at_five_seconds_and_reveals_on_activity() {
-        let now = Instant::now();
-        let mut state = chrome(now);
-        assert!(state.clean_visible(now + Duration::from_millis(4999), false, false));
-        assert!(!state.clean_visible(now + CLEAN_VIEW_IDLE, false, false));
-        assert!(!state.clean_visible(now + Duration::from_secs(20), false, false));
-        assert!(state.clean_visible(now + Duration::from_secs(20), false, true));
-        assert!(state.clean_visible(now + Duration::from_secs(24), false, false));
-        assert!(!state.clean_visible(now + Duration::from_secs(25), false, false));
-    }
-
-    #[test]
-    fn clean_view_interaction_holds_controls_and_restarts_countdown_on_exit() {
-        let now = Instant::now();
-        let mut state = chrome(now);
-        state.hide_now = true; // A fullscreen transition must still allow learning.
-        assert!(state.clean_visible(now + Duration::from_secs(10), true, false));
-        assert!(!state.hide_now);
-        // No frames while the user reads a menu; closing it still earns five seconds.
-        assert!(state.clean_visible(now + Duration::from_secs(100), false, false));
-        assert!(state.clean_visible(now + Duration::from_secs(104), false, false));
-        assert!(!state.clean_visible(now + Duration::from_secs(105), false, false));
-    }
-
-    #[test]
-    fn clean_view_consumes_reveal_press_hold_and_release_only() {
-        let mut state = chrome(Instant::now());
-        state.consume_reveal_primary(true, true, true, false);
-        assert!(state.consume_primary);
-        state.consume_reveal_primary(false, false, true, false);
-        assert!(state.consume_primary);
-        state.consume_reveal_primary(false, false, false, true);
-        assert!(state.consume_primary);
-        state.consume_reveal_primary(false, false, false, false);
-        assert!(!state.consume_primary);
-        state.consume_reveal_primary(false, true, true, false);
-        assert!(!state.consume_primary, "a normal tile press is untouched");
-        state.consume_reveal_primary(true, false, false, false);
-        assert!(!state.consume_primary, "secondary clicks are untouched");
-        state.consume_reveal_primary(true, true, false, true);
-        assert!(state.consume_primary, "a click can arrive entirely in one frame");
+    fn windowed_hiding_is_a_desktop_only_choice() {
+        // Both switches checked, but the window is not full screen. The windowed
+        // switch decides on a desktop; on Android this state is the viewer
+        // pinning their own bars, so it never hides however the switch was left.
+        let window_hides = XgViewApp::mode_may_hide(false, true, true);
+        assert_eq!(
+            window_hides,
+            !cfg!(target_os = "android"),
+            "Android pin bars must override a synced-in windowed switch"
+        );
+        // With the windowed switch off there is no hiding in a window anywhere.
+        assert!(!XgViewApp::mode_may_hide(false, true, false));
     }
 }
 
